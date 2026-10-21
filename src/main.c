@@ -1,5 +1,5 @@
-// __NAME__ - greet everyone listed in a Lua config
-// Copyright (C) 2026 Hugo Coto Florez
+// eyff - explore Your F*cking Files
+// Copyright (C) 2026 Hugo Coto
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <stdio.h>
@@ -16,24 +16,22 @@
 
 // Both come from the Makefile: NAME from the project, VERSION from git
 #ifndef NAME
-#define NAME "__NAME__"
+#define NAME "eyff"
 #endif
 #ifndef VERSION
 #define VERSION "unknown"
 #endif
 
+// What the config file sets. Add a field for each setting, with its default
+// and its Conf_get_* in load_config, and free what it owns in config_free.
 typedef struct {
-        char *greeting;
-        int times;
-        Da(char *) names;
+        char unused; // C99 needs a member: replace it with the first setting
 } Config;
 
 static void
 config_free(Config *config)
 {
-        free(config->greeting);
-        Da_foreach(name, config->names) free(*name);
-        Da_destroy(&config->names);
+        (void) config;
 }
 
 // Returns the user's config file, $XDG_CONFIG_HOME/NAME/config.lua (default
@@ -48,12 +46,13 @@ find_config(void)
         const char *xdg = getenv("XDG_CONFIG_HOME");
         const char *home = getenv("HOME");
 
-        if (xdg && *xdg)
+        if (xdg && *xdg) {
                 snprintf(path, sizeof path, "%s/" NAME "/config.lua", xdg);
-        else if (home && *home)
+        } else if (home && *home) {
                 snprintf(path, sizeof path, "%s/.config/" NAME "/config.lua", home);
-        else
+        } else {
                 path[0] = '\0';
+        }
 
         if (*path && access(path, R_OK) == 0) return strdup(path);
         return NULL;
@@ -67,15 +66,10 @@ load_config(Config *config, const char *path)
 {
         Conf conf = NULL;
         char *found = NULL;
-        const char *str;
-        int len;
 
-        *config = (Config) { .greeting = strdup("Hello"), .times = 1 };
+        *config = (Config) { 0 }; // The defaults
 
-        if (path == NULL && (path = found = find_config()) == NULL) {
-                Da_append(&config->names, strdup("world"));
-                return 0;
-        }
+        if (path == NULL && (path = found = find_config()) == NULL) return 0;
 
         if (Conf_open(&conf, path) != CONF_OK) {
                 fprintf(stderr, NAME ": can't load %s\n", path);
@@ -83,18 +77,8 @@ load_config(Config *config, const char *path)
                 return 1;
         }
 
-        // Strings belong to Lua and die with the next Conf_* call: copy them
-        if (Conf_get_str(conf, &str, "Config.greeting") == CONF_OK) {
-                free(config->greeting);
-                config->greeting = strdup(str);
-        }
-        Conf_get_int(conf, &config->times, "Config.times");
-        if (Conf_get_len(conf, &len, "Config.names") == CONF_OK) {
-                for (int i = 1; i <= len; i++) // Lua lists start at 1
-                        if (Conf_get_str(conf, &str, "Config.names.%d", i) == CONF_OK)
-                                Da_append(&config->names, strdup(str));
-        }
-        if (config->names.count == 0) Da_append(&config->names, strdup("world"));
+        // Read the settings here, e.g. Conf_get_int(conf, &config->n, "Config.n").
+        // Strings belong to Lua and die with the next Conf_* call: copy them.
 
         Conf_close(conf);
         free(found);
@@ -108,7 +92,9 @@ main(int argc, char **argv)
         const char *config_path;
         Config config;
 
-        flag_program(.help = "Greet everyone listed in a Lua config");
+        // .name: the usage line says NAME however it's run, so it's the same
+        // as in the README (test/docs.sh checks it)
+        flag_program(.name = NAME, .help = "Explore Your F*cking Files");
         flag_add(&show_version, "--version", "-v", .help = "Show version and exit");
         flag_add(&config_path, "--config", "-c", .nargs = 1, .help = "Use this config file");
 
@@ -129,9 +115,6 @@ main(int argc, char **argv)
                 flag_free();
                 return 1;
         }
-
-        for (int i = 0; i < config.times; i++)
-                Da_foreach(name, config.names) printf("%s, %s!\n", config.greeting, *name);
 
         config_free(&config);
         flag_free();

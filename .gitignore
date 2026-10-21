@@ -1,19 +1,9 @@
 /build/
-/__NAME__
+/eyff
 /*.tar.gz
 /VERSION
-# template-init: begin appimage
 /*.AppImage
-# template-init: end appimage
-# template-init: begin static
 /*-static
-# template-init: end static
-# template-init: begin man
 /*.1
-# template-init: end man
-# template-init: begin releases
 /CHANGELOG.md
-# template-init: end releases
-# template-init: begin docs
 docs/**/*.pdf
-# template-init: end docs

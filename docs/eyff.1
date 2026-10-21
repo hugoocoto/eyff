@@ -1,20 +1,32 @@
-.TH __NAME_UPPER__ 1 "@DATE@" "__NAME__ @VERSION@" "User Commands"
+.TH EYFF 1 "@DATE@" "eyff @VERSION@" "User Commands"
 .SH NAME
-__NAME__ \- greet everyone listed in a Lua config
+eyff \- explore Your F*cking Files
 .SH SYNOPSIS
-.B __NAME__
+.B eyff
 .RB [ \-h ]
+.RB [ \-\-completions
+.IR shell ]
 .RB [ \-v ]
 .RB [ \-c
 .IR file ]
 .SH DESCRIPTION
-.B __NAME__
-prints a greeting for every name in its config, as many times as the config
-says.
+.B eyff
+explores your files.
 .SH OPTIONS
 .TP
 .BR \-h ", " \-\-help
 Show the help and exit.
+.TP
+.BR \-\-completions " " \fIshell\fR
+Print the completion script for
+.IR shell ,
+which is
+.BR bash ,
+.B zsh
+or
+.BR fish ,
+and exit. For example:
+.B source <(eyff \-\-completions bash)
 .TP
 .BR \-v ", " \-\-version
 Show the version and exit.
@@ -25,8 +37,8 @@ Read the config from
 instead of the default ones.
 .SH FILES
 .TP
-.I $XDG_CONFIG_HOME/__NAME__/config.lua
-.RI ( ~/.config/__NAME__/config.lua
+.I $XDG_CONFIG_HOME/eyff/config.lua
+.RI ( ~/.config/eyff/config.lua
 if XDG_CONFIG_HOME is not set)
 The config, unless
 .B \-\-config
@@ -43,15 +55,12 @@ table. Every field is optional:
 .RS
 .nf
 Config = {
-    greeting = "Hello",           -- default "Hello"
-    times = 1,                    -- default 1
-    names = { "world", "you" },   -- default { "world" }
 }
 .fi
 .RE
 .SH EXIT STATUS
 0 on success, 1 if the arguments or the config are wrong.
 .SH AUTHOR
-Hugo Coto Florez <hugocoto100305@gmail.com>
+Hugo Coto <hugocoto100305@gmail.com>
 .SH SEE ALSO
 .BR lua (1)

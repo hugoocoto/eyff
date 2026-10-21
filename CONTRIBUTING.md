@@ -1,4 +1,4 @@
-# Contributing to \_\_NAME\_\_
+# Contributing to eyff
 
 Thanks for helping! Bug reports, ideas, docs and code are all welcome.
 
@@ -9,15 +9,13 @@ faster it gets fixed:
 
 - what you ran (the command, and the config if it matters),
 - what happened (the full output) and what you expected,
-- the output of `__NAME__ --version`, and how you installed it,
+- the output of `eyff --version`, and how you installed it,
 - your distro and architecture.
 
 Search the open issues first: someone may have reported it already.
 
-<!-- template-init: begin community -->
 A security problem goes privately instead, not in an issue: see
 [SECURITY.md](.github/SECURITY.md).
-<!-- template-init: end community -->
 
 ## Suggesting features
 
@@ -31,8 +29,8 @@ You need a C compiler (gcc or clang), make and Lua 5.4 (or 5.1, or LuaJIT)
 with its headers: see [Building](README.md#building).
 
 ```sh
-git clone --recursive https://github.com/<you>/__NAME__
-cd __NAME__
+git clone --recursive https://github.com/hugoocoto/eyff eyff
+cd eyff
 make hooks   # run the tests before every push
 make debug   # build with the sanitizers while working
 make test
@@ -44,17 +42,18 @@ Editors that use clangd get the right flags from `src/.clangd` and
 ### Project layout
 
 ```
-src/                 the program, every .c is compiled to build/src/*.o
-src/thirdparty/      git submodules: flag.h (flags), cum.h (macros), conf.h (Lua config)
-test/                one self-contained test program per .c
-scripts/test.sh      runs the tests (make test)
-docs/__NAME__.1      the man page
-docs/*.typ           Typst documents, to PDF with make docs
-completions/         bash, zsh and fish completions
-assets/              the AppImage icon
-scripts/install.sh   the install script, attached to every release
-scripts/release.sh   tags a release (scripts/changelog.sh writes its notes)
-scripts/hooks/       git hooks (make hooks)
+src/                     the program, every .c is compiled to build/src/*.o
+src/thirdparty/          git submodules: flag.h (flags), cum.h (macros), conf.h (Lua config)
+test/                    one self-contained test per .c (a program) or .sh (a bash script)
+scripts/test.sh          runs the tests (make test)
+scripts/github-setup.sh  sets up the GitHub repo's settings, with gh
+docs/eyff.1          the man page
+docs/*.typ               Typst documents, to PDF with make docs
+assets/                  the AppImage icon
+scripts/install.sh       the install script, attached to every release
+scripts/test-install.sh  tests it on a release (CI)
+scripts/release.sh       tags a release (scripts/changelog.sh writes its notes)
+scripts/hooks/           git hooks (make hooks)
 ```
 
 ## Making a change
@@ -79,7 +78,7 @@ reviewed much faster than big ones: split them when you can.
 - Format with `make format` (it leaves `src/thirdparty/` alone). CI checks it
   with the clang-format version in the Makefile (`CLANG_FORMAT_VERSION`): if
   yours formats differently, install that one with
-  `pip install clang-format==<version>` and run
+  `pipx install clang-format==<version>` and run
   `make format CLANG_FORMAT=~/.local/bin/clang-format`.
 - Functions that can fail return 0 on success and non-zero on error, and
   print the error themselves, starting with the program's name.
@@ -88,10 +87,11 @@ reviewed much faster than big ones: split them when you can.
 
 ## Tests
 
-Every `test/*.c` is a self-contained program: it exits 0 if it passes and
-anything else if it fails. `make test` builds the program and each test with
-sanitizers, then `scripts/test.sh` runs the tests in random order from the
-project root with a 10s timeout, and fails if any of them does.
+Every `test/*.c` is a self-contained program, and every `test/*.sh` a bash
+script: it exits 0 if it passes and anything else if it fails. `make test`
+builds the program and each C test with sanitizers, then `scripts/test.sh`
+runs the tests in random order from the project root with a 10s timeout, and
+fails if any of them does.
 
 The sanitizers make a test fail on things that would otherwise pass silently:
 
@@ -107,16 +107,24 @@ Writing tests:
 - `$TEST_BIN` is the program, also built with the sanitizers, for tests that
   run it (see `test/cli.c` and `test/output.c`, which checks what it
   prints): a leak in the program fails those tests too.
+- Shell tests are for what's easier to check from outside, like
+  `test/docs.sh`, which checks the docs against `--help`.
 - Tests don't depend on each other or on the order they run in.
 
 ## Documentation
 
 A change users can see updates, in the same pull request:
 
-- `--help` (in `src/main.c`) and Usage in the README, for a flag,
-- `config.lua` and Configuration in the README, for the config,
-- the man page, `docs/__NAME__.1` (check it with `man docs/__NAME__.1`),
-- the three files in `completions/`, for a flag.
+- `--help` (in `src/main.c`) and Usage in the README, for a flag
+- `config.lua` and Configuration in the README, for the config
+- the man page, `docs/eyff.1` (check it with `man docs/eyff.1`)
+- the manual, `docs/*.typ`
+
+`make test` checks them against `--help` (`test/docs.sh`): the README's
+Usage must be exactly what it prints, and the other docs must have every
+flag.
+The shell completions come from flag.h (`eyff --completions SHELL`), so they
+always have every flag.
 
 ## Commit messages
 
@@ -124,7 +132,6 @@ One change per commit. The first line says what it does, in under 72
 characters (`Add --quiet flag`, `Fix crash on empty config`). If it isn't
 obvious, the body says why.
 
-<!-- template-init: begin releases -->
 The first lines are the changelog and the release notes
 (`scripts/changelog.sh`, `make changelog` to see it), grouped by their first
 word:
@@ -137,7 +144,6 @@ word:
 | anything else (Change, Update, Make...)      | Changed  |
 
 So write them for users: `Fix crash on empty config`, not `fix bug`.
-<!-- template-init: end releases -->
 
 ## Third-party code
 
@@ -149,12 +155,9 @@ git -C src/thirdparty/flag pull origin main
 git add src/thirdparty/flag
 ```
 
-<!-- template-init: begin dependabot -->
 Dependabot also opens a pull request every week when they have new commits,
 and CI tests it.
-<!-- template-init: end dependabot -->
 
-<!-- template-init: begin releases -->
 ## Releases
 
 Maintainers release from main with `scripts/release.sh`, which asks for the
@@ -164,8 +167,7 @@ minor, the rest a patch; before 1.0.0, removing is minor too), and pushes its
 tag. CI then builds and publishes the release. Every push to main updates the
 nightly release.
 
-<!-- template-init: end releases -->
 ## License
 
-By contributing you agree that your work is licensed under the GPL-3.0 or
-later, like the rest of the project.
+By contributing you agree that your work is licensed under GPL-3.0-or-later,
+like the rest of the project.

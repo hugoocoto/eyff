@@ -1,20 +1,30 @@
 name: CI
 
-# Every push and PR runs the tests, and builds and checks what `make
-# release-arch` (on x86_64 and aarch64) and `make release-common` make.
-# template-init: begin releases
+# Every push to main and every pull request runs the tests, and builds and
+# checks what `make release-arch` (on x86_64 and aarch64) and `make
+# release-common` make. A branch without a pull request isn't tested: open
+# one, even as a draft.
 # A push to main also refreshes the "nightly" release with them, and a v* tag
 # (see scripts/release.sh) makes a release of its own, only if every job
 # passes. Their files are attested (signed as built by this workflow), and
 # their notes are their part of the changelog (scripts/changelog.sh).
-# template-init: end releases
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+
+# Read-only: the jobs that publish ask for more
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run that's testing the code it
+# replaces. Pushes to main and tags never cancel anything.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 env:
   DEPS: liblua5.4-dev
@@ -30,14 +40,18 @@ jobs:
         sanitize: ["address,undefined", thread]
     name: test (${{ matrix.cc }}, ${{ matrix.sanitize }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           fetch-depth: 0 # git describe needs the tags, for the version
+          persist-credentials: false
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y $DEPS
+        run: |
+          sudo apt-get update && sudo apt-get install -y $DEPS
+          sudo apt-get install -y zsh fish # test/completions.sh tries the completions in them
 
       # The runners randomize addresses more than the sanitizers can handle
       # ("FATAL: ThreadSanitizer: unexpected memory mapping")
@@ -53,30 +67,35 @@ jobs:
 
   format:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
 
-      # The version in the Makefile: others may format differently
+      # The version in the Makefile: others may format differently. pipx:
+      # the system's Python takes no pip installs (PEP 668)
       - name: Install clang-format
-        run: pip install "clang-format==$(sed -n 's/^CLANG_FORMAT_VERSION := //p' Makefile)"
+        run: pipx install "clang-format==$(sed -n 's/^CLANG_FORMAT_VERSION := //p' Makefile)"
 
       - name: Check the format
         run: make check-format
 
-      # Whatever scripts there are: the init script deletes itself, and the
-      # others depend on the parts it kept
+      # Whatever scripts there are, and the shell tests: the init script
+      # deletes itself, and the others depend on the parts it kept
       - name: Check the scripts
-        run: find scripts -type f -exec shellcheck {} +
+        run: find scripts test -type f \( -path 'scripts/*' -o -name '*.sh' \) -exec shellcheck {} +
 
   # The paths no test runs: clang's static analyzer (see `make analyze`)
   analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y $DEPS
@@ -84,13 +103,14 @@ jobs:
       - name: Analyze
         run: make analyze
 
-  # template-init: begin docs
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - uses: typst-community/setup-typst@fee4b65b091cc546f02ce3be15fad8760f38a108 # v5.3.0
         with:
@@ -104,13 +124,10 @@ jobs:
           name: docs
           path: docs/**/*.pdf
           if-no-files-found: ignore
-  # template-init: end docs
 
   package:
-    # template-init: begin appimage
     # The oldest runners: an AppImage needs a glibc at least as new as the one
     # it was built with, so this makes it run on more systems
-    # template-init: end appimage
     strategy:
       matrix:
         include:
@@ -122,18 +139,18 @@ jobs:
             make: release-arch
     name: package (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $DEPS
-          # template-init: begin static
           sudo apt-get install -y musl-tools # musl-gcc, for the static binary
-          # template-init: end static
 
       # The pinned tools and Lua (see the Makefile), checked before every use
       # whether they come from here or from the download
@@ -153,24 +170,22 @@ jobs:
         run: |
           shopt -s nullglob
           version=$(make -s version)
-          # template-init: begin static
           for bin in ./*-static; do
             [[ $("$bin" --version) == *" $version" ]]
             file -b "$bin" | grep -E 'statically linked|static-pie linked'
             "$bin" --config config.lua
           done
-          # template-init: end static
-          # template-init: begin appimage
           for bin in ./*.AppImage; do
             [[ $("$bin" --version) == *" $version" ]]
             "$bin" --config config.lua
           done
-          # template-init: end appimage
-          # template-init: begin man
           for man in ./*.1; do
             grep -q "$version" "$man"
           done
-          # template-init: end man
+          for completions in ./*-completions.tar.gz; do
+            tar -tvzf "$completions"
+            [ "$(tar -tzf "$completions" | grep -c '[^/]$')" = 3 ]
+          done
           # The source tarball builds on its own, and knows its version
           for src in ./*-"$version".tar.gz; do
             tar -xzf "$src" -C "$RUNNER_TEMP"
@@ -181,43 +196,116 @@ jobs:
             [[ $("$dir/$name" --version) == "$name $version" ]]
           done
 
-      # template-init: begin releases
+      # The tarballs are reproducible (see TAR in the Makefile): built again
+      # from scratch, elsewhere, later and as if checked out with another
+      # umask, they're the same bytes
+      - name: The tarballs are reproducible
+        if: contains(matrix.make, 'release-common')
+        run: |
+          again=$RUNNER_TEMP/again
+          cp -a . "$again"
+          rm -rf "$again/build" "$again"/*.tar.gz
+          chmod -R go-rwx "$again"
+          sleep 1
+          make -C "$again" release-common
+          for tarball in ./*.tar.gz; do
+            cmp "$tarball" "$again/$tarball"
+            echo "$tarball: the same"
+          done
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.arch }}
           path: |
             *.tar.gz
-            # template-init: begin appimage
             *.AppImage
-            # template-init: end appimage
-            # template-init: begin static
             *-static
-            # template-init: end static
-            # template-init: begin man
             *.1
-            # template-init: end man
           if-no-files-found: ignore
 
-  release:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+  # scripts/install.sh on what package made, served as a release from a dir:
+  # a broken install.sh fails here, before it's published
+  install-check:
+    needs: package
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      REPO: ${{ github.repository }}
+      APPIMAGE_EXTRACT_AND_RUN: 1 # the runners have no FUSE
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # make version needs the tags
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: ${{ runner.temp }}/github/${{ github.repository }}/releases/download/ci
+          merge-multiple: true
+
+      # Like the release job makes it, but for what install.sh doesn't use.
+      # GITHUB is where install.sh looks for releases.
+      - name: Make the release
+        run: |
+          echo "GITHUB=file://$RUNNER_TEMP/github" >>"$GITHUB_ENV"
+          cd "$RUNNER_TEMP/github/$REPO/releases/download/ci"
+          cp "$GITHUB_WORKSPACE/scripts/install.sh" .
+          sha256sum -- * >SHA256SUMS
+          ls -l
+
+      # No attestation: nothing's published yet
+      - name: Install, reinstall, uninstall
+        run: scripts/test-install.sh ci --skip-attestation
+
+      - name: Install as root, to /usr/local
+        run: |
+          name=$(sed -n 's/^NAME := //p' Makefile)
+          sudo --preserve-env=GITHUB,REPO bash scripts/install.sh --yes --skip-attestation ci
+          test -x "/usr/local/bin/$name"
+          sudo --preserve-env=GITHUB,REPO bash scripts/install.sh --yes uninstall
+          test ! -e "/usr/local/bin/$name"
+
+  # One check that passes only if every other one did, for main's ruleset to
+  # require (scripts/github-setup.sh), and for the release to wait for:
+  # requiring each job by name would break whenever they change
+  ok:
+    if: ${{ !cancelled() }}
     needs:
       - test
       - format
       - analyze
-      # template-init: begin docs
       - docs
-      # template-init: end docs
       - package
+      - install-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for result in $RESULTS; do [ "$result" = success ]; done
+
+  release:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: ok
     # One at a time: nightly's files are replaced in place
     concurrency:
       group: release-${{ github.ref }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: write
+      contents: write # the release, and the nightly tag
       id-token: write # for the attestation
       attestations: write
     steps:
+      # Its credentials stay: it pushes the nightly tag
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -247,12 +335,10 @@ jobs:
           # PDFs from docs/ subfolders keep their folders: flatten them
           find release -mindepth 2 -type f -exec mv -t release {} +
           find release -mindepth 1 -type d -delete
-          # template-init: begin install
           # The install script too, so it's attested like the rest: what the
           # README runs is releases/latest/download/install.sh
           cp scripts/install.sh release/
-          # template-init: end install
-          cd release && sha256sum * >SHA256SUMS
+          cd release && sha256sum -- * >SHA256SUMS
 
       # Proof that these files were built here, from this commit: `gh
       # attestation verify` checks SHA256SUMS, and SHA256SUMS the rest
@@ -282,7 +368,9 @@ jobs:
             exit
           fi
           cd release
-          gh release upload nightly $(ls | grep -vx SHA256SUMS) --repo "$GITHUB_REPOSITORY" --clobber
+          files=()
+          for file in *; do [ "$file" = SHA256SUMS ] || files+=("$file"); done
+          gh release upload nightly "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           gh release upload nightly SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
           # The files this build doesn't have, like the last one's source tarball
           gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' |
@@ -292,56 +380,32 @@ jobs:
           # Its date stays the first one's: the notes say when this was built
           gh release edit nightly --repo "$GITHUB_REPOSITORY" --title "Nightly $version" --notes-file ../notes.md
 
-  # template-init: end releases
-
-  # template-init: begin install
   install:
-    # scripts/install.sh, on the release just published, as users run it
+    # scripts/install.sh again, on the release just published, as users run
+    # it: from GitHub, checking its attestation
     needs: release
     strategy:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: read # for gh attestation verify
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
+      # --strict: no attestation fails
       - name: Install, reinstall, uninstall
         env:
           GH_TOKEN: ${{ github.token }} # gh attestation verify needs a login
           REPO: ${{ github.repository }}
-          APPIMAGE_EXTRACT_AND_RUN: 1 # the runners have no FUSE
         run: |
           [ "$GITHUB_REF_TYPE" = tag ] && tag=$GITHUB_REF_NAME || tag=nightly
-          name=$(sed -n 's/^NAME := //p' Makefile)
-          version=$(make -s version)
-          install=$PWD/scripts/install.sh
-          cd "$RUNNER_TEMP"
-          export PREFIX=prefix # relative on purpose
-          # --strict: no attestation fails
-          bash "$install" --yes --strict "$tag"
-          [[ $(prefix/bin/$name --version) == "$name $version" ]]
-          # template-init: begin man
-          test -f "prefix/share/man/man1/$name.1"
-          # template-init: end man
-          # template-init: begin completions
-          test -f "prefix/share/bash-completion/completions/$name"
-          # template-init: end completions
-          # template-init: begin appimage
-          bash "$install" --yes --strict --appimage "$tag"
-          [[ $(prefix/bin/$name --version) == "$name $version" ]]
-          test -f "prefix/share/applications/$name.desktop"
-          # template-init: begin static
-          # The AppImage is installed, so it's what's suggested now
-          bash "$install" --yes --strict "$tag"
-          test -f "prefix/share/applications/$name.desktop"
-          bash "$install" --yes --strict --static "$tag"
-          test ! -e "prefix/share/applications/$name.desktop"
-          # template-init: end static
-          # template-init: end appimage
-          bash "$install" --yes uninstall
-          [ -z "$(find prefix -type f)" ]
+          scripts/test-install.sh "$tag" --strict
 
       - name: The release's install.sh is this one, and attested
         env:
@@ -364,4 +428,3 @@ jobs:
           test -x "/usr/local/bin/$name"
           sudo --preserve-env=REPO bash scripts/install.sh --yes uninstall
           test ! -e "/usr/local/bin/$name"
-  # template-init: end install

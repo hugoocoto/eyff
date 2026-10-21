@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Install __NAME__ from its GitHub releases, nothing to build:
+# Install eyff from its GitHub releases, nothing to build:
 #
-#   curl -fsSL https://github.com/hugoocoto/c-tool/releases/latest/download/install.sh | bash
+#   curl -fsSL https://github.com/hugoocoto/eyff/releases/latest/download/install.sh | bash
 #
 # It asks what to install and where, suggesting what it finds: the latest
 # release, ~/.local, the kind already installed. Then it installs the binary
@@ -13,8 +13,8 @@
 # arguments, which go after `bash -s --`.
 set -euo pipefail
 
-NAME=__NAME__
-REPO=${REPO:-hugoocoto/c-tool}
+NAME=eyff
+REPO=${REPO:-hugoocoto/eyff}
 GITHUB=${GITHUB:-https://github.com}
 
 usage() {

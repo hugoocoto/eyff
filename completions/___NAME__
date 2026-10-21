@@ -1,8 +1,0 @@
-#compdef __NAME__
-# zsh completion for __NAME__. `make install` puts it in
-# $PREFIX/share/zsh/site-functions, which must be in your $fpath.
-
-_arguments -s \
-        '(- *)'{-h,--help}'[show the help and exit]' \
-        '(- *)'{-v,--version}'[show the version and exit]' \
-        '(-c --config)'{-c,--config=}'[use this config file]:config file:_files -g "*.lua"'

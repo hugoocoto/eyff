@@ -22,22 +22,16 @@ body:
   - type: input
     attributes:
       label: Version
-      description: The output of `__NAME__ --version`.
+      description: The output of `eyff --version`.
     validations:
       required: true
   - type: dropdown
     attributes:
       label: How you installed it
       options:
-        # template-init: begin install
         - install.sh (curl | bash)
-        # template-init: end install
-        # template-init: begin static
         - static binary from a release
-        # template-init: end static
-        # template-init: begin appimage
         - AppImage
-        # template-init: end appimage
         - built from source
     validations:
       required: true
