@@ -40,6 +40,15 @@ BUILD ?= build
 BIN ?= $(NAME)
 THIRDPARTY := src/thirdparty
 
+# What the build downloads: kept between builds, and it is not in `make dist`
+ARCH := $(shell uname -m)
+TOOLS := $(BUILD)/tools
+# Downloaded once into $(DL), which CI caches, and checked before every use
+DL := $(TOOLS)/downloads
+
+# $(call check,FILE,SHA256): stop, and remove FILE, unless it has that checksum
+check = @echo '$(2)  $(1)' | sha256sum -c --quiet || { rm -f $(1); echo "$(1): wrong checksum, removed it" >&2; exit 1; }
+
 ifeq ($(wildcard $(THIRDPARTY)/conf/CONF_FLAGS),)
 $(error submodules missing, run: git submodule update --init)
 endif
@@ -64,9 +73,27 @@ CFLAGS ?= -O2 $(HARDEN_CFLAGS)
 LDFLAGS ?= $(HARDEN_LDFLAGS)
 # `make WERROR=1` (CI) makes every warning an error
 WARN = -Wall -Wextra -Wformat=2 -Wshadow $(if $(WERROR),-Werror)
+# raylib's prebuilt binaries are per arch (GitHub releases, pinned to a
+# version and checked against its asset digests). Its static library is
+# glibc's, so only Linux builds link it.
+RAYLIB_VERSION := 6.2
+RAYLIB_ARCH_x86_64 := amd64
+RAYLIB_ARCH_aarch64 := arm64
+RAYLIB_ARCH_i686 := i386
+RAYLIB_ARCH_i386 := i386
+RAYLIB_ARCH := $(RAYLIB_ARCH_$(ARCH))
+RAYLIB_SHA256_amd64 := 586bbc32f3596d439382b1c5dbc6c1c573eb7e1d00fe92be7d4deb116883720d
+RAYLIB_SHA256_arm64 := 281f3456c9e11c090442f5c1ca923c2c272c8fe53e6693fcd22f07c52f76da5a
+RAYLIB_SHA256_i386 := f9de4b5abbd2db1e3acf1844e942547ceb66406607b214314747975f867099c7
+RAYLIB_TARBALL := $(DL)/raylib-$(RAYLIB_VERSION)_linux_$(RAYLIB_ARCH).tar.gz
+RAYLIB_DIR := $(TOOLS)/raylib-$(RAYLIB_VERSION)_linux-$(RAYLIB_ARCH)
+RAYLIB_LIB := $(RAYLIB_DIR)/lib/libraylib.a
+# -lX11 is raylib's windowing; OpenGL it loads at runtime
+RAYLIB_CFLAGS := -isystem $(RAYLIB_DIR)/include
+RAYLIB_LIBS := $(RAYLIB_LIB) -lm -ldl -lrt -lX11
 # The libraries are -isystem: their warnings are theirs, not this project's
-CPPFLAGS += -D_DEFAULT_SOURCE -Isrc $(addprefix -isystem $(THIRDPARTY)/,flag cum conf) $(LUA_CFLAGS)
-LDLIBS += $(LUA_LIBS) -pthread
+CPPFLAGS += -D_DEFAULT_SOURCE -Isrc $(addprefix -isystem $(THIRDPARTY)/,flag cum conf) $(RAYLIB_CFLAGS) $(LUA_CFLAGS)
+LDLIBS += $(LUA_LIBS) $(RAYLIB_LIBS) -pthread
 ALL_CFLAGS = -std=c99 $(WARN) $(CFLAGS)
 DEFINES = -DNAME='"$(NAME)"' $(if $(VERSION),-DVERSION='"$(VERSION)"')
 
@@ -98,11 +125,24 @@ all: $(BIN)
 $(BIN): $(OBJ) $(BUILD)/.flags
 	$(CC) $(LDFLAGS) $(OBJ) $(LDLIBS) -o $@
 
-$(BUILD)/%.o: %.c $(BUILD)/.flags $(LIB_HEADERS)
+$(BUILD)/%.o: %.c $(BUILD)/.flags $(LIB_HEADERS) $(RAYLIB_LIB)
 	@mkdir -p $(@D)
 	$(CC) $(ALL_CFLAGS) $(CPPFLAGS) $(DEFINES) -MMD -MP -c $< -o $@
 
 -include $(OBJ:.o=.d)
+
+# raylib's release tarball, unpacked where $(RAYLIB_CFLAGS) and $(RAYLIB_LIBS)
+# point at it: an object file may include raylib.h, so every one waits for it
+$(RAYLIB_TARBALL):
+	@test -n "$(RAYLIB_ARCH)" || { echo "raylib $(RAYLIB_VERSION) has no prebuilt binaries for $(ARCH)" >&2; exit 1; }
+	@mkdir -p $(@D)
+	curl -fsSL -o $@ https://github.com/raysan5/raylib/releases/download/$(RAYLIB_VERSION)/raylib-$(RAYLIB_VERSION)_linux_$(RAYLIB_ARCH).tar.gz
+
+$(RAYLIB_LIB): $(RAYLIB_TARBALL)
+	$(call check,$(RAYLIB_TARBALL),$(RAYLIB_SHA256_$(RAYLIB_ARCH)))
+	rm -rf $(RAYLIB_DIR)
+	mkdir -p $(RAYLIB_DIR)
+	tar -xzf $(RAYLIB_TARBALL) -C $(RAYLIB_DIR) --strip-components=1
 
 debug:
 	$(MAKE) CFLAGS='$(DEBUG_FLAGS)' LDFLAGS='$(SAN_FLAGS)'
@@ -190,17 +230,6 @@ release-common: dist
 release-common: man
 release-common: completions
 release-arch: appimage
-release-arch: static
-
-# Packages are built for the machine's arch (x86_64 or aarch64), with what
-# they download
-ARCH := $(shell uname -m)
-TOOLS := $(BUILD)/tools
-# Downloaded once into $(DL), which CI caches, and checked before every use
-DL := $(TOOLS)/downloads
-
-# $(call check,FILE,SHA256): stop, and remove FILE, unless it has that checksum
-check = @echo '$(2)  $(1)' | sha256sum -c --quiet || { rm -f $(1); echo "$(1): wrong checksum, removed it" >&2; exit 1; }
 
 # Bundles every shared library the binary needs (except glibc and friends, see
 # linuxdeploy's excludelist) into $(NAME)-$(ARCH).AppImage
@@ -260,36 +289,6 @@ $(RUNTIME):
 	@mkdir -p $(@D)
 	curl -fsSL -o $@ https://github.com/AppImage/type2-runtime/releases/download/$(RUNTIME_VERSION)/runtime-$(ARCH)
 
-# Fully static binary, $(NAME)-$(ARCH)-static, that runs on any Linux of its
-# arch. Distro Lua libraries are built for glibc, so Lua is built from source
-# with musl (needs musl-gcc: the musl package on Arch, musl-tools on Debian).
-.PHONY: static
-MUSL_CC ?= musl-gcc
-STATIC := $(NAME)-$(ARCH)-static
-LUA_VERSION := 5.4.9
-LUA_SHA256 := 2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6
-LUA_SRC := $(TOOLS)/lua-$(LUA_VERSION)/src
-LUA_TARBALL := $(DL)/lua-$(LUA_VERSION).tar.gz
-
-static: $(STATIC)
-
-$(STATIC): $(LUA_SRC)/liblua.a FORCE
-	@$(MAKE) --no-print-directory BUILD=$(BUILD)/static BIN=$(BUILD)/static/$(NAME) CC=$(MUSL_CC) \
-		LUA_CFLAGS=-I$(LUA_SRC) LUA_LIBS='$(LUA_SRC)/liblua.a -lm' LDFLAGS='-static -s' $(BUILD)/static/$(NAME)
-	cp $(BUILD)/static/$(NAME) $@
-
-$(LUA_TARBALL):
-	@mkdir -p $(@D)
-	curl -fsSL -o $@ https://www.lua.org/ftp/lua-$(LUA_VERSION).tar.gz
-
-$(LUA_SRC)/liblua.a: $(LUA_TARBALL)
-	$(call check,$(LUA_TARBALL),$(LUA_SHA256))
-	rm -rf $(TOOLS)/lua-$(LUA_VERSION)
-	tar -xzf $(LUA_TARBALL) -C $(TOOLS)
-	$(MAKE) -C $(LUA_SRC) a CC=$(MUSL_CC) MYCFLAGS=-DLUA_USE_POSIX
-
-FORCE:
-
 # Source tarball with the submodules and a VERSION file (GitHub's own
 # tarballs have neither): what git tracks, but what's deleted already
 dist:
@@ -324,13 +323,12 @@ version:
 hooks:
 	git config core.hooksPath scripts/hooks
 
-# What the build makes. The downloaded tools and Lua are kept.
+# What the build makes. The downloaded tools and libraries are kept.
 clean:
-	rm -rf $(NAME) $(NAME).1 CHANGELOG.md $(BUILD)/.flags $(BUILD)/src $(BUILD)/test $(BUILD)/AppDir $(BUILD)/dist $(BUILD)/static $(BUILD)/$(NAME).* $(BUILD)/$(NAME)-completions
+	rm -rf $(NAME) $(NAME).1 CHANGELOG.md $(BUILD)/.flags $(BUILD)/src $(BUILD)/test $(BUILD)/AppDir $(BUILD)/dist $(BUILD)/$(NAME).* $(BUILD)/$(NAME)-completions
 
 # Back to a fresh clone: also the downloads and every package
 distclean: clean
 	rm -rf $(BUILD) $(NAME)-*.tar.gz
 	rm -f $(NAME)-*.AppImage
-	rm -f $(NAME)-*-static
 	find docs -name '*.pdf' -delete

@@ -105,8 +105,7 @@ Writing tests:
 - Tests can include anything in `src/` and `src/thirdparty/`, and link with
   pthreads and Lua.
 - `$TEST_BIN` is the program, also built with the sanitizers, for tests that
-  run it (see `test/cli.c` and `test/output.c`, which checks what it
-  prints): a leak in the program fails those tests too.
+  run it: a leak in the program fails those tests too.
 - Shell tests are for what's easier to check from outside, like
   `test/docs.sh`, which checks the docs against `--help`.
 - Tests don't depend on each other or on the order they run in.

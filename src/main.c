@@ -28,6 +28,11 @@ typedef struct {
         char unused; // C99 needs a member: replace it with the first setting
 } Config;
 
+void
+explorer()
+{
+}
+
 static void
 config_free(Config *config)
 {
@@ -115,6 +120,8 @@ main(int argc, char **argv)
                 flag_free();
                 return 1;
         }
+
+        explorer();
 
         config_free(&config);
         flag_free();
