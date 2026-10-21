@@ -93,7 +93,7 @@ RAYLIB_LIBS_both := $(RAYLIB_LIBS_x11) $(RAYLIB_LIBS_wayland)
 RAYLIB_LIBS := $(RAYLIB_LIB) $(RAYLIB_LIBS_$(BACKEND)) -lm -ldl -lrt
 # The libraries are -isystem: their warnings are theirs, not this project's
 CPPFLAGS += -D_DEFAULT_SOURCE -Isrc $(addprefix -isystem $(THIRDPARTY)/,flag cum conf) $(RAYLIB_CFLAGS) $(LUA_CFLAGS)
-LDLIBS += $(LUA_LIBS) $(RAYLIB_LIBS) -pthread
+LDLIBS += $(LUA_LIBS) $(RAYLIB_LIBS) -pthread -lfontconfig
 ALL_CFLAGS = -std=c99 $(WARN) $(CFLAGS)
 DEFINES = -DNAME='"$(NAME)"' $(if $(VERSION),-DVERSION='"$(VERSION)"')
 

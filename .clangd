@@ -1,0 +1,18 @@
+# Without a compile_commands.json, clangd runs each file from its own dir
+# (src/), so these paths are relative to it. raylib.h is the same for every
+# BACKEND: x11 is the default build.
+CompileFlags:
+  Add:
+    - -std=c99
+    - -D_DEFAULT_SOURCE
+    - -I.
+    - -isystem
+    - thirdparty/flag
+    - -isystem
+    - thirdparty/cum
+    - -isystem
+    - thirdparty/conf
+    - -isystem
+    - ../build/tools/raylib-6.2-x11/src
+    - -isystem
+    - /usr/include/lua5.4
