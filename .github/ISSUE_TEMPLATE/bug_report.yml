@@ -30,7 +30,6 @@ body:
       label: How you installed it
       options:
         - install.sh (curl | bash)
-        - static binary from a release
         - AppImage
         - built from source
     validations:

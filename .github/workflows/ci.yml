@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DEPS: liblua5.4-dev
+  DEPS: liblua5.4-dev libx11-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev
 
 jobs:
   test:
@@ -64,6 +64,23 @@ jobs:
 
       - name: Test
         run: make test CC=${{ matrix.cc }} SANITIZE=${{ matrix.sanitize }} WERROR=1
+
+  # The default build and the packages use X11 and both, so this is the other
+  # BACKEND (the make test matrix builds and tests x11)
+  backends:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y $DEPS
+
+      - name: Build for Wayland only
+        run: make BACKEND=wayland WERROR=1
 
   format:
     runs-on: ubuntu-latest
@@ -148,12 +165,10 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y $DEPS
-          sudo apt-get install -y musl-tools # musl-gcc, for the static binary
+        run: sudo apt-get update && sudo apt-get install -y $DEPS
 
-      # The pinned tools and Lua (see the Makefile), checked before every use
-      # whether they come from here or from the download
+      # What the Makefile downloads (raylib and the release tools), checked
+      # before every use whether they come from here or from the download
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: build/tools/downloads
@@ -161,7 +176,7 @@ jobs:
           restore-keys: downloads-${{ matrix.arch }}-
 
       - name: Build
-        run: make ${{ matrix.make }} WERROR=1
+        run: make BACKEND=both ${{ matrix.make }} WERROR=1
 
       # What gets released works, before it's released
       - name: Check the release files
@@ -170,11 +185,6 @@ jobs:
         run: |
           shopt -s nullglob
           version=$(make -s version)
-          for bin in ./*-static; do
-            [[ $("$bin" --version) == *" $version" ]]
-            file -b "$bin" | grep -E 'statically linked|static-pie linked'
-            "$bin" --config config.lua
-          done
           for bin in ./*.AppImage; do
             [[ $("$bin" --version) == *" $version" ]]
             "$bin" --config config.lua
@@ -219,7 +229,6 @@ jobs:
           path: |
             *.tar.gz
             *.AppImage
-            *-static
             *.1
           if-no-files-found: ignore
 
@@ -276,6 +285,7 @@ jobs:
     if: ${{ !cancelled() }}
     needs:
       - test
+      - backends
       - format
       - analyze
       - docs

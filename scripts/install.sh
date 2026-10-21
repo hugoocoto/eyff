@@ -4,8 +4,8 @@
 #   curl -fsSL https://github.com/hugoocoto/eyff/releases/latest/download/install.sh | bash
 #
 # It asks what to install and where, suggesting what it finds: the latest
-# release, ~/.local, the kind already installed. Then it installs the binary
-# for this machine (from `uname -m`), the man page and the bash, zsh and fish
+# release, ~/.local. Then it installs the AppImage for this machine (from
+# `uname -m`), the man page and the bash, zsh and fish
 # completions, checking them against the release's SHA256SUMS, and SHA256SUMS
 # against the release's build attestation when gh is logged in. Nothing is
 # replaced until everything is downloaded and checked. Without a terminal, or
@@ -27,10 +27,8 @@ where; the arguments change what it suggests.
   VERSION              that release (v1.2.3 or 1.2.3) instead of the latest one
   nightly              the build of the last commit on main
   uninstall            remove everything this script installs
-  --appimage           the AppImage instead of the static binary (it needs
-                       FUSE), with its applications menu entry and icon
-  --static             the static binary (the default, unless the AppImage is
-                       what's installed)
+  --appimage           the AppImage, which is the only binary now: it needs
+                       FUSE to run
   -y, --yes            don't ask, take the suggestions (also without a terminal)
   --strict             fail if the release's attestation can't be checked
                        (needs gh, logged in)
@@ -128,7 +126,7 @@ set_prefix() {
         else
                 FISHDIR=$PREFIX/share/fish/vendor_completions.d
         fi
-        # The AppImage's menu entry and icon (only with --appimage)
+        # The AppImage's menu entry and icon
         APPSDIR=$PREFIX/share/applications
         ICONSDIR=$PREFIX/share/icons
         DESKTOP_FILES=("$APPSDIR/$NAME.desktop" "$ICONSDIR"/hicolor/*/apps/"$NAME".{svg,png})
@@ -204,8 +202,8 @@ download() {
 }
 
 # Whether the release (its SHA256SUMS, in the current dir) has FILE. Every
-# file but the binary is optional: a project may not make a man page,
-# completions, an AppImage or a static binary.
+# file but the AppImage is optional: a project may not make a man page or
+# completions.
 has() {
         awk -v f="$1" '$2 == f || $2 == "*" f { found = 1 } END { exit !found }' SHA256SUMS
 }
@@ -270,27 +268,16 @@ integrate_desktop() {
         say "Added $NAME to the applications menu"
 }
 
-# The menu entry of an earlier --appimage install, now that it's the static binary
-remove_desktop() {
-        local f removed=''
-        for f in "${DESKTOP_FILES[@]}"; do
-                [ -e "$f" ] && rm -f "$f" && removed=1
-        done
-        [ -z "$removed" ] || { refresh_desktop; say "Removed the AppImage's applications menu entry"; }
-}
-
 # The whole script runs from here, at its last line: if the download is cut,
 # bash runs nothing instead of half of it
 main() {
-        local tag='' kind='' yes='' strict='' skip_attest='' action=install
+        local tag='' yes='' strict='' skip_attest='' action=install
         local arch url bin version found arg prefix current newest why checks try extras
-        local -a kinds
 
         for arg; do
                 case $arg in
                 -h | --help) usage; return ;;
-                --appimage) kind=appimage ;;
-                --static) kind=static ;;
+                --appimage) ;; # the only binary; kept for old command lines
                 -y | --yes) yes=1 ;;
                 --strict) strict=1 ;;
                 --skip-attestation) skip_attest=1 ;;
@@ -351,32 +338,11 @@ main() {
         url=$GITHUB/$REPO/releases/download/$tag
         fetch "$url/SHA256SUMS" SHA256SUMS ||
                 die "$REPO has no release $tag, or it has no SHA256SUMS (releases: $GITHUB/$REPO/releases)"
-        kinds=()
-        if has "$NAME-$arch-static"; then kinds+=(static); fi
-        if has "$NAME-$arch.AppImage"; then kinds+=(appimage); fi
-        [ ${#kinds[@]} != 0 ] || die "release $tag has nothing for $arch"
+        has "$NAME-$arch.AppImage" || die "release $tag has no AppImage for $arch"
+        bin=$NAME-$arch.AppImage
         extras=''
         if has "$NAME.1"; then extras+=" $NAME.1"; fi
         if has "$NAME-completions.tar.gz"; then extras+=" $NAME-completions.tar.gz"; fi
-
-        # The kind asked for, else the one installed now, else the static
-        # binary (it runs anywhere), of the ones the release has
-        if [ -n "$kind" ]; then
-                [[ " ${kinds[*]} " == *" $kind "* ]] || die "release $tag has no $kind for $arch"
-        else
-                kind=${current#* }
-                [[ " ${kinds[*]} " == *" $kind "* ]] || kind=${kinds[0]}
-        fi
-        if [ ${#kinds[@]} = 1 ]; then
-                say "Kind: $kind, the only one release $tag has"
-        else
-                choose kind "Static binary or AppImage" "$kind" "${kinds[@]}"
-        fi
-        if [ "$kind" = appimage ]; then
-                bin=$NAME-$arch.AppImage
-        else
-                bin=$NAME-$arch-static
-        fi
 
         why=''
         [ -n "$skip_attest" ] || why=$(no_attest)
@@ -389,7 +355,7 @@ main() {
                 checks="SHA256SUMS and the release's attestation"
         fi
         say "Checks: $checks"
-        confirm "Install $NAME $tag ($kind, $arch) to $PREFIX?" || die "cancelled"
+        confirm "Install $NAME $tag (AppImage, $arch) to $PREFIX?" || die "cancelled"
 
         say "Downloading $NAME $tag ($arch)"
         # CI replaces nightly's files one by one, so for a moment they may
@@ -411,19 +377,13 @@ main() {
         fi
         if [ -f "$NAME.1" ]; then stage 644 "$NAME.1" "$MANDIR/$NAME.1"; fi
         commit
-        if [ "$kind" = appimage ]; then
-                integrate_desktop "$bin"
-        else
-                remove_desktop
-        fi
+        integrate_desktop "$bin"
 
         if version=$("$BINDIR/$NAME" --version 2>/dev/null); then
                 say "Installed $version to $BINDIR/$NAME"
-        elif [ "$kind" = appimage ]; then
-                say "Installed $bin to $BINDIR/$NAME, but it can't run: AppImages need FUSE"
-                say "(the fuse or fuse3 package). Or install the static binary."
         else
-                die "installed $BINDIR/$NAME, but it doesn't run"
+                say "Installed $bin to $BINDIR/$NAME, but it can't run: AppImages need FUSE"
+                say "(the fuse or fuse3 package)."
         fi
         case ":$PATH:" in
         *":$BINDIR:"*) ;;

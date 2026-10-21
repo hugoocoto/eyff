@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Test scripts/install.sh on a release, the way users run it: install,
-# reinstall, switch between the static binary and the AppImage, uninstall.
+# reinstall, uninstall.
 #
 #   scripts/test-install.sh TAG [OPTION...]
 #
@@ -34,14 +34,11 @@ test -f "prefix/share/man/man1/$name.1"
 test -f "prefix/share/bash-completion/completions/$name"
 test -f "prefix/share/zsh/site-functions/_$name"
 test -f "prefix/share/fish/vendor_completions.d/$name.fish"
+test -f "prefix/share/applications/$name.desktop"
 run "$@" --appimage "$tag"
 installed
-test -f "prefix/share/applications/$name.desktop"
-# The AppImage is installed, so it's what's suggested now
 run "$@" "$tag"
-test -f "prefix/share/applications/$name.desktop"
-run "$@" --static "$tag"
-test ! -e "prefix/share/applications/$name.desktop"
+installed
 run uninstall
 [ -z "$(find prefix -type f)" ]
 echo "install.sh installs, reinstalls and uninstalls $name $version ($tag)"

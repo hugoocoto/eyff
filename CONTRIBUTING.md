@@ -44,6 +44,7 @@ Editors that use clangd get the right flags from `src/.clangd` and
 ```
 src/                     the program, every .c is compiled to build/src/*.o
 src/thirdparty/          git submodules: flag.h (flags), cum.h (macros), conf.h (Lua config)
+build/tools/             what the build downloads and builds: raylib, the release tools
 test/                    one self-contained test per .c (a program) or .sh (a bash script)
 scripts/test.sh          runs the tests (make test)
 scripts/github-setup.sh  sets up the GitHub repo's settings, with gh
@@ -102,8 +103,9 @@ The sanitizers make a test fail on things that would otherwise pass silently:
 
 Writing tests:
 
-- Tests can include anything in `src/` and `src/thirdparty/`, and link with
-  pthreads and Lua.
+- Tests can include anything in `src/`, `src/thirdparty/` and raylib (but
+  don't open a window: CI has no display), and link with pthreads, Lua and
+  raylib.
 - `$TEST_BIN` is the program, also built with the sanitizers, for tests that
   run it: a leak in the program fails those tests too.
 - Shell tests are for what's easier to check from outside, like
@@ -156,6 +158,12 @@ git add src/thirdparty/flag
 
 Dependabot also opens a pull request every week when they have new commits,
 and CI tests it.
+
+raylib is not a submodule: the Makefile downloads its source from GitHub,
+checks it against a SHA-256, and builds it with the GLFW backends `BACKEND`
+asks for (`x11` by default, `wayland`, or `both`). To update it, change
+`RAYLIB_VERSION` and `RAYLIB_SHA256` in the Makefile. To add a backend, add
+its libraries to `RAYLIB_LIBS_<name>`.
 
 ## Releases
 

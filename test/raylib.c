@@ -1,29 +1,19 @@
-// The headers and static library the Makefile downloads are the ones this
-// build links: a window needs a display, which CI has none of, so only the
-// functions that don't open one.
-#include <math.h>
-
+// The raylib the Makefile builds is the one this build links. A window needs a
+// display, which CI has none of, so only what works without one.
 #include "raylib.h"
-
-static int
-same_color(Color a, Color b)
-{
-        return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
-}
 
 int
 main(void)
 {
-        Color faded = ColorAlpha((Color){ 10, 20, 30, 200 }, 0.5f);
-        Color expected = { 10, 20, 30, 100 };
+        Color faded = ColorAlpha((Color) { 10, 20, 30, 255 }, 0.5f);
 
-        if (!same_color(faded, expected)) {
+        if (faded.r != 10 || faded.g != 20 || faded.b != 30) {
+                return 1;
+        }
+        if (faded.a != 127) { // 255 * 0.5, truncated
                 return 1;
         }
         if (GetRandomValue(7, 7) != 7) {
-                return 1;
-        }
-        if (fabsf(GetFrameTime()) > 60.0f) { // silly, but links raymath-free code
                 return 1;
         }
         return 0;

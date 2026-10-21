@@ -25,18 +25,14 @@ repo. Nothing is replaced until it all checks out. Arguments, after
 ```sh
 curl -fsSL https://github.com/hugoocoto/eyff/releases/latest/download/install.sh | bash -s -- v1.2.3     # that release
 curl -fsSL https://github.com/hugoocoto/eyff/releases/latest/download/install.sh | bash -s -- nightly    # the last commit on main
-curl -fsSL https://github.com/hugoocoto/eyff/releases/latest/download/install.sh | bash -s -- --appimage # the AppImage instead
 curl -fsSL https://github.com/hugoocoto/eyff/releases/latest/download/install.sh | bash -s -- --strict   # fail without the attestation check
 curl -fsSL https://github.com/hugoocoto/eyff/releases/latest/download/install.sh | bash -s -- uninstall
 curl -fsSL https://github.com/hugoocoto/eyff/releases/latest/download/install.sh | bash -s -- --yes      # no questions
 curl -fsSL https://github.com/hugoocoto/eyff/releases/latest/download/install.sh | PREFIX=~/opt bash     # somewhere else
 ```
 
-It installs the static binary, which needs nothing else installed, unless
-you have the AppImage installed or ask for it with `--appimage`.
-The AppImage is installed as `eyff` too, and added to your applications
-menu, with its icon (installing the static binary again takes them out). It
-works the same, but needs FUSE (the `fuse` or `fuse3` package).
+It installs the AppImage as `eyff`, added to your applications menu, with
+its icon. It needs FUSE (the `fuse` or `fuse3` package).
 
 `uninstall` removes it all, also what `make install` put in the same places.
 Releases made before attestations need `--skip-attestation`.
@@ -64,7 +60,6 @@ Every [release](../../releases/latest) has, for x86_64 and aarch64:
 
 | File                      | What                                           |
 |---------------------------|------------------------------------------------|
-| `eyff-<arch>-static`      | the program, a static binary (built with musl) |
 | `eyff-<arch>.AppImage`    | the program, as an AppImage                    |
 | `eyff-completions.tar.gz` | bash, zsh and fish completions                 |
 | `eyff.1`                  | the man page                                   |
@@ -82,7 +77,7 @@ sha256sum -c --ignore-missing SHA256SUMS
 ```
 
 ```sh
-install -Dm755 eyff-x86_64-static ~/.local/bin/eyff    # or eyff-aarch64-static
+install -Dm755 eyff-x86_64.AppImage ~/.local/bin/eyff    # or eyff-aarch64.AppImage
 ```
 
 ```sh
@@ -147,13 +142,16 @@ It's plain Lua, so it can compute values, read environment variables, etc.
 Needs a C compiler, make and Lua 5.4 with its headers (or Lua 5.1 or
 LuaJIT, with `make LUA=lua5.1` or `make LUA=luajit`):
 
-| Distro        | Packages        |
-|---------------|-----------------|
-| Arch          | `lua54`         |
-| Debian/Ubuntu | `liblua5.4-dev` |
+| Distro        | Packages                                                       |
+|---------------|----------------------------------------------------------------|
+| Arch          | `lua54 libx11 wayland libxkbcommon mesa`                       |
+| Debian/Ubuntu | `liblua5.4-dev libx11-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev` |
 
-`make static` also needs musl-gcc: `musl` on Arch, `musl-tools` on
-Debian/Ubuntu.
+`BACKEND` picks raylib's windowing: `x11` (the default), `wayland`, or `both`
+(one binary, which follows the session: Wayland on Wayland, X11 on X11). The
+X11 build also runs on Wayland desktops, through XWayland. The first build
+downloads raylib's source, pinned in the Makefile and checked against its
+tarball's checksum, and builds it, so it needs the network once.
 
 ```sh
 git clone --recursive https://github.com/hugoocoto/eyff eyff
@@ -167,6 +165,7 @@ make
 | `make`                      | build `./eyff` (objects in `build/`), hardened          |
 | `make WERROR=1`             | the same, failing on any warning, like CI               |
 | `make LUA=luajit`           | the same, with LuaJIT (or `LUA=lua5.1`)                 |
+| `make BACKEND=wayland`      | the same, native Wayland (or `BACKEND=both`)            |
 | `make debug`                | `-O0 -ggdb` with the address and undefined sanitizers   |
 | `make test`                 | build and run the tests, with the same sanitizers       |
 | `make test SANITIZE=thread` | the tests again, looking for data races                 |
@@ -174,7 +173,6 @@ make
 | `make check-format`         | check it's formatted, like CI does                      |
 | `make install`              | install it to `~/.local` (`PREFIX`, `DESTDIR`)          |
 | `make uninstall`            | remove them                                             |
-| `make static`               | `eyff-<arch>-static`, a static binary (needs musl-gcc)  |
 | `make appimage`             | `eyff-<arch>.AppImage` (downloads its pinned tools)     |
 | `make completions`          | `eyff-completions.tar.gz`, from `eyff --completions`    |
 | `make dist`                 | `eyff-<version>.tar.gz`, the source with the submodules |
@@ -246,4 +244,5 @@ Bug reports, ideas and pull requests are welcome.
 Copyright (C) 2026 Hugo Coto
 
 GPL-3.0-or-later, see [LICENSE](LICENSE).
-The libraries in `src/thirdparty/` keep their own licenses.
+The libraries in `src/thirdparty/` keep their own licenses, and so does
+raylib (zlib), which the build downloads.

@@ -73,24 +73,24 @@ CFLAGS ?= -O2 $(HARDEN_CFLAGS)
 LDFLAGS ?= $(HARDEN_LDFLAGS)
 # `make WERROR=1` (CI) makes every warning an error
 WARN = -Wall -Wextra -Wformat=2 -Wshadow $(if $(WERROR),-Werror)
-# raylib's prebuilt binaries are per arch (GitHub releases, pinned to a
-# version and checked against its asset digests). Its static library is
-# glibc's, so only Linux builds link it.
+# raylib: built from source, because its prebuilt Linux binaries are X11 only.
+# BACKEND picks the GLFW backends compiled in; with both, GLFW follows the
+# session (XDG_SESSION_TYPE): Wayland on Wayland, X11 on X11.
+BACKEND ?= x11
+ifneq ($(filter x11 wayland both,$(BACKEND)),$(BACKEND))
+$(error BACKEND must be x11, wayland or both, this is $(BACKEND))
+endif
 RAYLIB_VERSION := 6.2
-RAYLIB_ARCH_x86_64 := amd64
-RAYLIB_ARCH_aarch64 := arm64
-RAYLIB_ARCH_i686 := i386
-RAYLIB_ARCH_i386 := i386
-RAYLIB_ARCH := $(RAYLIB_ARCH_$(ARCH))
-RAYLIB_SHA256_amd64 := 586bbc32f3596d439382b1c5dbc6c1c573eb7e1d00fe92be7d4deb116883720d
-RAYLIB_SHA256_arm64 := 281f3456c9e11c090442f5c1ca923c2c272c8fe53e6693fcd22f07c52f76da5a
-RAYLIB_SHA256_i386 := f9de4b5abbd2db1e3acf1844e942547ceb66406607b214314747975f867099c7
-RAYLIB_TARBALL := $(DL)/raylib-$(RAYLIB_VERSION)_linux_$(RAYLIB_ARCH).tar.gz
-RAYLIB_DIR := $(TOOLS)/raylib-$(RAYLIB_VERSION)_linux-$(RAYLIB_ARCH)
-RAYLIB_LIB := $(RAYLIB_DIR)/lib/libraylib.a
-# -lX11 is raylib's windowing; OpenGL it loads at runtime
-RAYLIB_CFLAGS := -isystem $(RAYLIB_DIR)/include
-RAYLIB_LIBS := $(RAYLIB_LIB) -lm -ldl -lrt -lX11
+RAYLIB_SHA256 := df7a13129b1bec9e73a6962efff170beba310ee6eab8f94cd000b7316b4db5ee
+RAYLIB_TARBALL := $(DL)/raylib-$(RAYLIB_VERSION).tar.gz
+RAYLIB_DIR := $(TOOLS)/raylib-$(RAYLIB_VERSION)-$(BACKEND)
+RAYLIB_LIB := $(RAYLIB_DIR)/src/libraylib.a
+RAYLIB_CFLAGS := -isystem $(RAYLIB_DIR)/src
+# OpenGL it loads at runtime; these are the windowing libraries of each backend
+RAYLIB_LIBS_wayland := -lwayland-client -lwayland-cursor -lwayland-egl -lxkbcommon
+RAYLIB_LIBS_x11 := -lX11
+RAYLIB_LIBS_both := $(RAYLIB_LIBS_x11) $(RAYLIB_LIBS_wayland)
+RAYLIB_LIBS := $(RAYLIB_LIB) $(RAYLIB_LIBS_$(BACKEND)) -lm -ldl -lrt
 # The libraries are -isystem: their warnings are theirs, not this project's
 CPPFLAGS += -D_DEFAULT_SOURCE -Isrc $(addprefix -isystem $(THIRDPARTY)/,flag cum conf) $(RAYLIB_CFLAGS) $(LUA_CFLAGS)
 LDLIBS += $(LUA_LIBS) $(RAYLIB_LIBS) -pthread
@@ -131,18 +131,26 @@ $(BUILD)/%.o: %.c $(BUILD)/.flags $(LIB_HEADERS) $(RAYLIB_LIB)
 
 -include $(OBJ:.o=.d)
 
-# raylib's release tarball, unpacked where $(RAYLIB_CFLAGS) and $(RAYLIB_LIBS)
+# raylib's source tarball, built where $(RAYLIB_CFLAGS) and $(RAYLIB_LIBS)
 # point at it: an object file may include raylib.h, so every one waits for it
 $(RAYLIB_TARBALL):
-	@test -n "$(RAYLIB_ARCH)" || { echo "raylib $(RAYLIB_VERSION) has no prebuilt binaries for $(ARCH)" >&2; exit 1; }
 	@mkdir -p $(@D)
-	curl -fsSL -o $@ https://github.com/raysan5/raylib/releases/download/$(RAYLIB_VERSION)/raylib-$(RAYLIB_VERSION)_linux_$(RAYLIB_ARCH).tar.gz
+	curl -fsSL -o $@ https://github.com/raysan5/raylib/archive/refs/tags/$(RAYLIB_VERSION).tar.gz
 
+# raylib's own Makefile takes no CFLAGS from here (make test and make debug
+# pass theirs on the command line, and it must not build raylib with them), and
+# a clean MAKEFLAGS drops the jobserver, so -j again
 $(RAYLIB_LIB): $(RAYLIB_TARBALL)
-	$(call check,$(RAYLIB_TARBALL),$(RAYLIB_SHA256_$(RAYLIB_ARCH)))
+	@test "$(shell uname -s)" = Linux || { echo "raylib: its X11 and Wayland backends are built on Linux only" >&2; exit 1; }
+	$(call check,$(RAYLIB_TARBALL),$(RAYLIB_SHA256))
 	rm -rf $(RAYLIB_DIR)
 	mkdir -p $(RAYLIB_DIR)
 	tar -xzf $(RAYLIB_TARBALL) -C $(RAYLIB_DIR) --strip-components=1
+	env -u MAKEFLAGS -u MFLAGS $(MAKE) -C $(RAYLIB_DIR)/src -j$(shell nproc 2>/dev/null || echo 1) \
+		PLATFORM=PLATFORM_DESKTOP RAYLIB_LIBTYPE=STATIC CC='$(CC)' \
+		GLFW_LINUX_ENABLE_X11=$(if $(filter x11 both,$(BACKEND)),TRUE,FALSE) \
+		GLFW_LINUX_ENABLE_WAYLAND=$(if $(filter wayland both,$(BACKEND)),TRUE,FALSE)
+	touch $@ # the archive's own timestamps are older than the tarball
 
 debug:
 	$(MAKE) CFLAGS='$(DEBUG_FLAGS)' LDFLAGS='$(SAN_FLAGS)'
@@ -156,7 +164,7 @@ test: export TEST_LDLIBS = $(SAN_FLAGS) $(LDLIBS)
 test: export TEST_BIN = $(TEST_BUILD)/$(NAME)
 test: export TEST_OUT = $(TEST_BUILD)/tests
 test:
-	@$(MAKE) --no-print-directory BUILD=$(TEST_BUILD) BIN=$(TEST_BUILD)/$(NAME) \
+	@$(MAKE) --no-print-directory BUILD=$(TEST_BUILD) BIN=$(TEST_BUILD)/$(NAME) TOOLS=$(abspath $(TOOLS)) \
 		CFLAGS='-O1 -ggdb $(SAN_FLAGS)' LDFLAGS='$(SAN_FLAGS)' $(TEST_BUILD)/$(NAME)
 	@scripts/test.sh
 

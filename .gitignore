@@ -3,7 +3,6 @@
 /*.tar.gz
 /VERSION
 /*.AppImage
-/*-static
 /*.1
 /CHANGELOG.md
 docs/**/*.pdf
