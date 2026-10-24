@@ -1,4 +1,4 @@
-// eyff - explore Your F*cking Files
+// eyff - explore your f*cking files
 // Copyright (C) 2026 Hugo Coto
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -204,7 +204,7 @@ font_find_by_name(const char *name)
         }
 
 free_resources:
-        FcPatternDestroy(0); // assert that it is not going to explode on error
+        FcPatternDestroy(0); // assert that this is not going to break on error
         FcPatternDestroy(pattern);
         FcPatternDestroy(match);
         FcFini();
@@ -700,6 +700,14 @@ explorer(const char *path)
                                 if (g.root != g.entry_list.items[g.cursor] &&
                                     g.entry_list.items[g.cursor]->is_dir) {
                                         change_root(g.entry_list.items[g.cursor]);
+                                } else if (!g.entry_list.items[g.cursor]->is_dir) {
+                                        // the problem with this approach is that the terminal is the same, so
+                                        // nvim runs in the same terminal for example, and logs break nvim. If I
+                                        // detach, nvim runs in a terminal that is not visible, so it's not a
+                                        // solution.
+                                        Command c = { 0 };
+                                        Command_add(&c, "xdg-open", g.entry_list.items[g.cursor]->path);
+                                        Command_run_async(c);
                                 }
                         }
 
