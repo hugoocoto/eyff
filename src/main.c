@@ -45,7 +45,6 @@
 #include <dirent.h>
 #include <fontconfig/fontconfig.h>
 #include <linux/limits.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +94,16 @@ typedef struct Grid {
 typedef struct Entry Entry;
 typedef Da(struct Entry *) Entry_List;
 
+typedef enum Sort_Type {
+        SORT_NONE,
+        SORT_ALPHA,
+} Sort_Type;
+
+typedef enum Filters {
+        FILTER_NONE = 0,
+        FILTER_IGNORE_DOTS = 1 << 0,
+} Filters;
+
 // globals
 static struct {
         Font font;
@@ -103,7 +112,14 @@ static struct {
         Grid grid;
         Entry *root;
         Entry_List entry_list;
-} G;
+        Sort_Type entry_list_sort_method;
+        Filters entry_list_filters;
+        int cursor;
+        bool list_need_refresh;
+} G = {
+        .entry_list_sort_method = SORT_ALPHA,
+        .entry_list_filters = 0 | FILTER_IGNORE_DOTS,
+};
 
 struct Entry {
         const char *path;
@@ -144,6 +160,13 @@ entry_flatten(Entry *e)
         return l;
 }
 
+void
+cursor_trim()
+{
+        if (G.cursor >= G.entry_list.count) G.cursor = G.entry_list.count - 1;
+        if (G.cursor < 0) G.cursor = 0;
+}
+
 char *
 font_find_by_name(const char *name)
 {
@@ -171,7 +194,6 @@ font_find_by_name(const char *name)
                 goto free_resources;
         }
 
-
         if (FcPatternGetString(match, FC_FILE, 0, &route) == FcResultMatch) {
                 sroute = strdup((char *) route);
         }
@@ -187,7 +209,8 @@ free_resources:
 void
 Write(const char *text, int cw, int ch, Color tint)
 {
-        DrawTextEx(G.font, text, (Vector2) { G.csize.x * cw, G.csize.y * ch }, config.font_size, config.font_spacing, tint);
+        DrawTextEx(G.font, text, (Vector2) { G.csize.x * cw, G.csize.y * ch },
+                   config.font_size, config.font_spacing, tint);
 }
 
 void
@@ -228,11 +251,47 @@ entry_list_print(Entry_List list, int cursor)
         }
 }
 
+int
+entry_cmp(const void *a, const void *b)
+{
+        return strcmp((*(Entry **) a)->path, (*(Entry **) b)->path);
+}
+
+void
+filter(Entry_List *list, bool(f)(Entry *))
+{
+        for (int i = 0; i < list->count; i++) {
+                if (f(list->items[i]) == false) {
+                        Da_remove(list, i);
+                        i--;
+                }
+        }
+}
+
+// true if pass the filter
+bool
+entry_list_filter_dots(Entry *e)
+{
+        return GetFileName(e->path)[0] != '.';
+}
+
+void
+entry_list_sort_by_name(Entry_List *list)
+{
+        qsort(list->items, list->count, sizeof(*list->items), entry_cmp);
+}
+
 void
 refresh_global_entry_list()
 {
         if (G.entry_list.capacity > 0) Da_destroy(&G.entry_list);
         G.entry_list = entry_flatten(G.root);
+
+        if (G.entry_list_sort_method == SORT_ALPHA) entry_list_sort_by_name(&G.entry_list);
+        if (G.entry_list_filters & FILTER_IGNORE_DOTS) filter(&G.entry_list, entry_list_filter_dots);
+
+        G.list_need_refresh = false;
+        cursor_trim();
 }
 
 void
@@ -240,7 +299,7 @@ entry_visibility_show(Entry *e)
 {
         if (e->is_dir && !e->is_extended) {
                 e->is_extended = true;
-                refresh_global_entry_list();
+                G.list_need_refresh = true;
         }
 }
 
@@ -250,7 +309,7 @@ entry_visibility_hide(Entry *e)
         // maybe this should turn off all the subdirs '->extend
         if (e->is_dir && e->is_extended) {
                 e->is_extended = false;
-                refresh_global_entry_list();
+                G.list_need_refresh = true;
         }
 }
 
@@ -262,11 +321,11 @@ entry_toggle_visibility(Entry *e)
 }
 
 // clang-format off
-typedef enum  {
+typedef enum {
 NUL=0, SOH, STX, ETX, EOT, ENQ, ACK, BEL, BS   , HT     , LF , VT ,
 FF   , CR , SO , SI , DLE, DC1, DC2, DC3, DC4  , NAK    , SYN, ETB,
 CAN  , EM , SUB, ESC, FS , GS , RS , US , SPACE, DEL=127,
-}ControlChar;
+} ControlChar;
 // clang-format on
 
 const char WITHOUT_SHIFT[128] = {
@@ -555,10 +614,6 @@ explorer(const char *path)
         open_directory(G.root);
 
         refresh_global_entry_list();
-        // Da_foreach(ee, entry_list)
-        // {
-        //         printf("  %s (%s)\n", (*ee)->path, (**ee).is_dir ? "DIR" : "OTH");
-        // }
 
         SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
         InitWindow(config.width, config.height, config.title);
@@ -573,7 +628,7 @@ explorer(const char *path)
         config.font_size = G.font.baseSize;
 
         bool first = true;
-        int cursor = 0;
+        G.cursor = 0;
 
         bool has_ctrl = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
         bool has_shift = IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT);
@@ -605,44 +660,51 @@ explorer(const char *path)
                         if (0) {
                         }
 
+                        // J, C-n or Down
                         else if (key == 'J' || (has_ctrl && key == 'N') || key == KEY_DOWN) {
-                                ++cursor;
-                                if (cursor >= G.entry_list.count) cursor = G.entry_list.count - 1;
+                                ++G.cursor;
+                                cursor_trim();
                         }
 
+                        // k, C-p or Up
                         else if (key == 'K' || (has_ctrl && key == 'P') || key == KEY_UP) {
-                                --cursor;
-                                if (cursor < 0) cursor = 0;
+                                --G.cursor;
+                                cursor_trim();
                         }
 
                         else if (key == KEY_ENTER) {
-                                printf("ENTER on %s\n", G.entry_list.items[cursor]->path);
+                                printf("ENTER on %s\n", G.entry_list.items[G.cursor]->path);
                         }
 
                         else if (key == KEY_SPACE) {
-                                printf("SPACE on %s\n", G.entry_list.items[cursor]->path);
-                                entry_toggle_visibility(G.entry_list.items[cursor]);
+                                printf("SPACE on %s\n", G.entry_list.items[G.cursor]->path);
+                                entry_toggle_visibility(G.entry_list.items[G.cursor]);
                         }
 
                         else if (has_shift && key == '.') { // '>'
                                 // opens the dir
-                                entry_visibility_show(G.entry_list.items[cursor]);
+                                entry_visibility_show(G.entry_list.items[G.cursor]);
+                        }
+
+                        else if (!has_shift && key == '.') {
+                                G.entry_list_filters ^= FILTER_IGNORE_DOTS;
+                                G.list_need_refresh = true;
                         }
 
                         else if (has_shift && key == ',') { // '<'
                                 // closes the parent dir or current if the
                                 // cursor is over a directory and it's open
-                                if (G.entry_list.items[cursor]->is_dir &&
-                                    G.entry_list.items[cursor]->is_extended) {
-                                        entry_visibility_hide(G.entry_list.items[cursor]);
+                                if (G.entry_list.items[G.cursor]->is_dir &&
+                                    G.entry_list.items[G.cursor]->is_extended) {
+                                        entry_visibility_hide(G.entry_list.items[G.cursor]);
                                 }
 
                                 else {
                                         // search for the parent index
                                         int i = 0;
                                         for (; i < G.entry_list.count; i++) {
-                                                if (G.entry_list.items[i] == G.entry_list.items[cursor]->parent) {
-                                                        cursor = i;
+                                                if (G.entry_list.items[i] == G.entry_list.items[G.cursor]->parent) {
+                                                        G.cursor = i;
                                                         entry_visibility_hide(G.entry_list.items[i]);
                                                         break;
                                                 }
@@ -665,7 +727,8 @@ explorer(const char *path)
                 BeginDrawing();
                 ClearBackground(BLACK);
 
-                entry_list_print(G.entry_list, cursor);
+                if (G.list_need_refresh) refresh_global_entry_list();
+                entry_list_print(G.entry_list, G.cursor);
 
                 // window bounds for debugging
                 DrawRectangleLines(0, 0, G.grid.cols * G.csize.x, G.grid.rows * G.csize.y, RED);
@@ -675,9 +738,8 @@ explorer(const char *path)
 }
 
 static void
-config_free(Config *config)
+config_free()
 {
-        (void) config;
 }
 
 // Returns the user's config file, $XDG_CONFIG_HOME/NAME/config.lua (default
@@ -708,7 +770,7 @@ find_config(void)
 // from the file keep their defaults, and no file at all is not an error.
 // Returns 0 on success.
 static int
-load_config(Config *config, const char *path)
+load_config(const char *path)
 {
         Conf conf = NULL;
         char *found = NULL;
@@ -721,9 +783,9 @@ load_config(Config *config, const char *path)
                 return 1;
         }
 
-        Conf_get_int(conf, &config->width, "Config.window.width");
-        Conf_get_int(conf, &config->height, "Config.window.height");
-        Conf_get_str(conf, &config->title, "Config.window.title");
+        Conf_get_int(conf, &config.width, "Config.window.width");
+        Conf_get_int(conf, &config.height, "Config.window.height");
+        Conf_get_str(conf, &config.title, "Config.window.title");
 
         Conf_close(conf);
         free(found);
@@ -754,15 +816,15 @@ main(int argc, char **argv)
                 return 0;
         }
 
-        if (load_config(&config, config_path)) {
-                config_free(&config);
+        if (load_config(config_path)) {
+                config_free();
                 flag_free();
                 return 1;
         }
 
         explorer(0);
 
-        config_free(&config);
+        config_free();
         flag_free();
         return 0;
 }
