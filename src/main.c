@@ -110,15 +110,20 @@ static struct {
         Rectangle usable;
         Vector2 csize;
         Grid grid;
+
         Entry *root;
+
         Entry_List entry_list;
         Sort_Type entry_list_sort_method;
         Filters entry_list_filters;
+
         int cursor;
         bool list_need_refresh;
-} G = {
+        bool lazy;
+} g = {
         .entry_list_sort_method = SORT_ALPHA,
         .entry_list_filters = 0 | FILTER_IGNORE_DOTS,
+        .lazy = true, // lazy load directory contents
 };
 
 struct Entry {
@@ -163,8 +168,8 @@ entry_flatten(Entry *e)
 void
 cursor_trim()
 {
-        if (G.cursor >= G.entry_list.count) G.cursor = G.entry_list.count - 1;
-        if (G.cursor < 0) G.cursor = 0;
+        if (g.cursor >= g.entry_list.count) g.cursor = g.entry_list.count - 1;
+        if (g.cursor < 0) g.cursor = 0;
 }
 
 char *
@@ -209,23 +214,21 @@ free_resources:
 void
 Write(const char *text, int cw, int ch, Color tint)
 {
-        DrawTextEx(G.font, text, (Vector2) { G.csize.x * cw, G.csize.y * ch },
+        DrawTextEx(g.font, text, (Vector2) { g.csize.x * cw, g.csize.y * ch },
                    config.font_size, config.font_spacing, tint);
 }
 
 void
 open_directory(Entry *entry)
 {
-        static int nesting_level = 0;
+        printf("Open directory %s\n", entry->path);
         assert(IsPathDirectory(entry->path));
 
         FilePathList list = LoadDirectoryFiles(entry->path);
         for (unsigned int i = 0; i < list.count; i++) {
-                Entry *e = entry_create(list.paths[i], entry, false, nesting_level);
-                if (e->is_dir) {
-                        ++nesting_level;
+                Entry *e = entry_create(list.paths[i], entry, false, entry->nesting_level + 1);
+                if (e->is_dir && !g.lazy) {
                         open_directory(e);
-                        --nesting_level;
                 }
                 Da_append(&entry->files, e);
         }
@@ -235,18 +238,20 @@ void
 entry_list_print(Entry_List list, int cursor)
 {
         int tabsize = 2;
+        int tabstart = list.items[0]->nesting_level;
         for (int i = 0; i < list.count; i++) {
                 Entry *e = list.items[i];
+                int cx = (e->nesting_level - tabstart) * tabsize;
                 Color color = WHITE;
 
                 if (i == cursor) {
-                        DrawRectangle(G.csize.x * e->nesting_level * tabsize, G.csize.y * i, G.csize.x, config.font_size, LIGHTGRAY);
+                        DrawRectangle(g.csize.x * cx, g.csize.y * i, g.csize.x, config.font_size, LIGHTGRAY);
                 }
 
-                Write(GetFileName(e->path), e->nesting_level * tabsize, i, color);
+                Write(GetFileName(e->path), cx, i, color);
 
                 if (e->is_dir) {
-                        Write("/", e->nesting_level * tabsize + strlen(GetFileName(e->path)), i, color);
+                        Write("/", cx + strlen(GetFileName(e->path)), i, color);
                 }
         }
 }
@@ -260,7 +265,9 @@ entry_cmp(const void *a, const void *b)
 void
 filter(Entry_List *list, bool(f)(Entry *))
 {
-        for (int i = 0; i < list->count; i++) {
+        // start at 1 because the first entry is the root path so there is no
+        // reason to hide it
+        for (int i = 1; i < list->count; i++) {
                 if (f(list->items[i]) == false) {
                         Da_remove(list, i);
                         i--;
@@ -284,13 +291,13 @@ entry_list_sort_by_name(Entry_List *list)
 void
 refresh_global_entry_list()
 {
-        if (G.entry_list.capacity > 0) Da_destroy(&G.entry_list);
-        G.entry_list = entry_flatten(G.root);
+        if (g.entry_list.capacity > 0) Da_destroy(&g.entry_list);
+        g.entry_list = entry_flatten(g.root);
 
-        if (G.entry_list_sort_method == SORT_ALPHA) entry_list_sort_by_name(&G.entry_list);
-        if (G.entry_list_filters & FILTER_IGNORE_DOTS) filter(&G.entry_list, entry_list_filter_dots);
+        if (g.entry_list_sort_method == SORT_ALPHA) entry_list_sort_by_name(&g.entry_list);
+        if (g.entry_list_filters & FILTER_IGNORE_DOTS) filter(&g.entry_list, entry_list_filter_dots);
 
-        G.list_need_refresh = false;
+        g.list_need_refresh = false;
         cursor_trim();
 }
 
@@ -298,8 +305,11 @@ void
 entry_visibility_show(Entry *e)
 {
         if (e->is_dir && !e->is_extended) {
+                if (g.lazy && e->files.count == 0 && GetDirectoryFileCount(e->path) > 0) {
+                        open_directory(e);
+                }
                 e->is_extended = true;
-                G.list_need_refresh = true;
+                g.list_need_refresh = true;
         }
 }
 
@@ -309,7 +319,7 @@ entry_visibility_hide(Entry *e)
         // maybe this should turn off all the subdirs '->extend
         if (e->is_dir && e->is_extended) {
                 e->is_extended = false;
-                G.list_need_refresh = true;
+                g.list_need_refresh = true;
         }
 }
 
@@ -321,12 +331,16 @@ entry_toggle_visibility(Entry *e)
 }
 
 // clang-format off
-typedef enum {
-NUL=0, SOH, STX, ETX, EOT, ENQ, ACK, BEL, BS   , HT     , LF , VT ,
-FF   , CR , SO , SI , DLE, DC1, DC2, DC3, DC4  , NAK    , SYN, ETB,
-CAN  , EM , SUB, ESC, FS , GS , RS , US , SPACE, DEL=127,
-} ControlChar;
+enum {
+        NUL=0, SOH, STX, ETX, EOT, ENQ, ACK, BEL, BS   , HT     , LF , VT ,
+        FF   , CR , SO , SI , DLE, DC1, DC2, DC3, DC4  , NAK    , SYN, ETB,
+        CAN  , EM , SUB, ESC, FS , GS , RS , US , SPACE, DEL=127,
+};
 // clang-format on
+
+// +---------------------------------------------------------------+
+// | keyboard layout: This might only work for US qwerty. UNTESTED |
+// +---------------------------------------------------------------+
 
 const char WITHOUT_SHIFT[128] = {
         [0x00] = NUL, /* '\0' (null character)   */
@@ -606,44 +620,52 @@ using_shift(int kp)
         return kp;
 }
 
+void
+change_root(Entry *new)
+{
+        g.root = new;
+        g.cursor = 0;
+        entry_visibility_show(g.root);
+        g.list_need_refresh = true;
+}
+
 // open cwd on null
 void
 explorer(const char *path)
 {
-        G.root = entry_create(path ?: GetWorkingDirectory(), NULL, true, 0);
-        open_directory(G.root);
+        g.root = entry_create(path ?: GetWorkingDirectory(), NULL, true, 0);
+        open_directory(g.root);
 
         refresh_global_entry_list();
 
         SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+        SetTraceLogLevel(LOG_WARNING);
         InitWindow(config.width, config.height, config.title);
 
         // Load config.font_name or 'monospace' or raylib default
-        G.font = LoadFontEx(font_find_by_name(config.font_name) ?: font_find_by_name("monospace"),
+        g.font = LoadFontEx(font_find_by_name(config.font_name) ?: font_find_by_name("monospace"),
                             config.font_size, NULL, 0);
 
-        if (!IsFontValid(G.font)) {
-                G.font = GetFontDefault();
+        if (!IsFontValid(g.font)) {
+                g.font = GetFontDefault();
         }
-        config.font_size = G.font.baseSize;
+        config.font_size = g.font.baseSize;
 
         bool first = true;
-        G.cursor = 0;
+        g.cursor = 0;
 
         bool has_ctrl = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
         bool has_shift = IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT);
 
         while (!WindowShouldClose()) {
                 if (first || IsWindowResized()) {
-                        G.csize = MeasureTextEx(G.font, " ", config.font_size, config.font_spacing);
-
-                        G.usable.x = 0;
-                        G.usable.y = 0;
-                        G.usable.width = GetRenderWidth();
-                        G.usable.height = GetRenderHeight();
-
-                        G.grid.cols = G.csize.x > 0 ? (int) ((G.usable.width - G.usable.x) / G.csize.x) : 0;
-                        G.grid.rows = G.csize.y > 0 ? (int) ((G.usable.height - G.usable.y) / G.csize.y) : 0;
+                        g.csize = MeasureTextEx(g.font, " ", config.font_size, config.font_spacing);
+                        g.usable.x = 0;
+                        g.usable.y = 0;
+                        g.usable.width = GetRenderWidth();
+                        g.usable.height = GetRenderHeight();
+                        g.grid.cols = g.csize.x > 0 ? (int) ((g.usable.width - g.usable.x) / g.csize.x) : 0;
+                        g.grid.rows = g.csize.y > 0 ? (int) ((g.usable.height - g.usable.y) / g.csize.y) : 0;
                         first = false;
                 }
 
@@ -662,55 +684,74 @@ explorer(const char *path)
 
                         // J, C-n or Down
                         else if (key == 'J' || (has_ctrl && key == 'N') || key == KEY_DOWN) {
-                                ++G.cursor;
+                                ++g.cursor;
                                 cursor_trim();
                         }
 
                         // k, C-p or Up
                         else if (key == 'K' || (has_ctrl && key == 'P') || key == KEY_UP) {
-                                --G.cursor;
+                                --g.cursor;
                                 cursor_trim();
                         }
 
                         else if (key == KEY_ENTER) {
-                                printf("ENTER on %s\n", G.entry_list.items[G.cursor]->path);
+                                printf("ENTER on %s\n", g.entry_list.items[g.cursor]->path);
+                                // change the root to the folder under the cursor
+                                if (g.root != g.entry_list.items[g.cursor] &&
+                                    g.entry_list.items[g.cursor]->is_dir) {
+                                        change_root(g.entry_list.items[g.cursor]);
+                                }
+                        }
+
+                        else if (key == KEY_BACKSPACE) {
+                                printf("BACKSPACE on %s\n", g.entry_list.items[g.cursor]->path);
+                                // change the root to the parent folder
+                                if (g.root->parent) {
+                                        change_root(g.entry_list.items[g.cursor]->parent);
+                                } else {
+                                        Entry *e = entry_create(GetPrevDirectoryPath(g.root->path),
+                                                                NULL, true, g.root->nesting_level - 1);
+                                        g.root->parent = e;
+                                        open_directory(e);
+                                        change_root(e);
+                                }
                         }
 
                         else if (key == KEY_SPACE) {
-                                printf("SPACE on %s\n", G.entry_list.items[G.cursor]->path);
-                                entry_toggle_visibility(G.entry_list.items[G.cursor]);
+                                printf("SPACE on %s\n", g.entry_list.items[g.cursor]->path);
+                                entry_toggle_visibility(g.entry_list.items[g.cursor]);
                         }
 
                         else if (has_shift && key == '.') { // '>'
                                 // opens the dir
-                                entry_visibility_show(G.entry_list.items[G.cursor]);
+                                entry_visibility_show(g.entry_list.items[g.cursor]);
                         }
 
                         else if (!has_shift && key == '.') {
-                                G.entry_list_filters ^= FILTER_IGNORE_DOTS;
-                                G.list_need_refresh = true;
+                                // toggle dot filter (hide files starting with a dots)
+                                g.entry_list_filters ^= FILTER_IGNORE_DOTS;
+                                g.list_need_refresh = true;
                         }
 
                         else if (has_shift && key == ',') { // '<'
                                 // closes the parent dir or current if the
                                 // cursor is over a directory and it's open
-                                if (G.entry_list.items[G.cursor]->is_dir &&
-                                    G.entry_list.items[G.cursor]->is_extended) {
-                                        entry_visibility_hide(G.entry_list.items[G.cursor]);
+                                if (g.entry_list.items[g.cursor]->is_dir &&
+                                    g.entry_list.items[g.cursor]->is_extended) {
+                                        entry_visibility_hide(g.entry_list.items[g.cursor]);
                                 }
 
                                 else {
                                         // search for the parent index
                                         int i = 0;
-                                        for (; i < G.entry_list.count; i++) {
-                                                if (G.entry_list.items[i] == G.entry_list.items[G.cursor]->parent) {
-                                                        G.cursor = i;
-                                                        entry_visibility_hide(G.entry_list.items[i]);
+                                        for (; i < g.entry_list.count; i++) {
+                                                if (g.entry_list.items[i] == g.entry_list.items[g.cursor]->parent) {
+                                                        g.cursor = i;
+                                                        entry_visibility_hide(g.entry_list.items[i]);
                                                         break;
                                                 }
                                         }
                                 }
-
                         }
 
                         else {
@@ -727,11 +768,11 @@ explorer(const char *path)
                 BeginDrawing();
                 ClearBackground(BLACK);
 
-                if (G.list_need_refresh) refresh_global_entry_list();
-                entry_list_print(G.entry_list, G.cursor);
+                if (g.list_need_refresh) refresh_global_entry_list();
+                entry_list_print(g.entry_list, g.cursor);
 
                 // window bounds for debugging
-                DrawRectangleLines(0, 0, G.grid.cols * G.csize.x, G.grid.rows * G.csize.y, RED);
+                DrawRectangleLines(0, 0, g.grid.cols * g.csize.x, g.grid.rows * g.csize.y, RED);
 
                 EndDrawing();
         }
