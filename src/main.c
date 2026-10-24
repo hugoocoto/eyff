@@ -2,10 +2,50 @@
 // Copyright (C) 2026 Hugo Coto
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// SetLoadFileDataCallback
+// SetSaveFileDataCallback
+// SetLoadFileTextCallback
+// SetSaveFileTextCallback
+// FileRename
+// FileRemove
+// FileCopy
+// FileMove
+// FileTextReplace
+// FileTextFindIndex
+// FileExists
+// DirectoryExists
+// IsFileExtension
+// IsFileHidden
+// GetFileLength
+// GetFileModTime
+// GetFileExtension
+// GetFileName
+// GetFileNameWithoutExt
+// GetDirectoryPath
+// GetPrevDirectoryPath
+// GetWorkingDirectory
+// GetApplicationDirectory
+// MakeDirectory
+// ChangeDirectory
+// IsPathFile
+// IsPathDirectory
+// IsPathAbsolute
+// IsFileNameValid
+// LoadDirectoryFiles
+// LoadDirectoryFilesEx
+// UnloadDirectoryFiles
+// IsFileDropped
+// LoadDroppedFiles
+// UnloadDroppedFiles
+// GetDirectoryFileCount
+// GetDirectoryFileCountEx
+
 #include <assert.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <fontconfig/fontconfig.h>
 #include <linux/limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,72 +88,61 @@ Config config = {
         .font_spacing = 0,
 };
 
-typedef struct Directory_or_Entry Directory_or_Entry;
-typedef Da(Directory_or_Entry) Directory_List;
-
-typedef struct File_Info {
-        /* dirent.h */
-        ino_t d_ino;
-        char d_name[NAME_MAX];
-        /* sys/stat.h */
-        dev_t st_dev;     // Device ID of device containing file.
-        ino_t st_ino;     // File serial number.
-        mode_t st_mode;   // Mode of file (see below).
-        nlink_t st_nlink; // Number of hard links to the file.
-        uid_t st_uid;     // User ID of file.
-        gid_t st_gid;     // Group ID of file.
-        dev_t st_rdev;    // Device ID (if file is character or block special).
-        off_t st_size;    // For regular files, the file size in bytes. For
-                          // symbolic links, the length in bytes of the pathname
-                          // contained in the symbolic link. For a shared memory
-                          // object, the length in bytes. For a typed memory
-                          // object, the length in bytes. For other file types,
-                          // the use of this field is unspecified.
-
-        struct timespec st_atim; // Last data access timestamp.
-        struct timespec st_mtim; // Last data modification timestamp.
-        struct timespec st_ctim; // Last file status change timestamp.
-        blksize_t st_blksize;    // A file system-specific preferred I/O block size
-                                 // for this object. In some file system types, this
-                                 // may vary from file to file.
-        blkcnt_t st_blocks;      // Number of blocks allocated for this object.
-} File_Info;
-
-typedef struct Entry {
-        File_Info info;
-} Entry;
-
-typedef struct Directory {
-        File_Info info;
-        struct Directory *parent;
-        char path[PATH_MAX]; // full path to this dir, unlike info.d_name
-        int enties_with_subdir_count;
-        Directory_List entries;
-        bool show_files : 1; // show files inside this directory
-        bool valid      : 1;
-} Directory;
-
-struct Directory_or_Entry {
-        Directory *_d;
-        Entry *_e;
-        enum {
-                TYPE_DIR,
-                TYPE_ENTRY,
-        } type;
-};
-
 typedef struct Grid {
         int rows, cols;
 } Grid;
 
+typedef struct Entry Entry;
+typedef Da(struct Entry *) Entry_List;
+
 // globals
 static struct {
-        Directory *root;
         Font font;
-        Grid grid;
         Rectangle usable;
         Vector2 csize;
+        Grid grid;
+        Entry *root;
+        Entry_List entry_list;
 } G;
+
+struct Entry {
+        const char *path;
+        Entry *parent;
+        Entry_List files; // just for directories
+        int nesting_level;
+
+        unsigned char is_dir      : 1;
+        unsigned char is_extended : 1;
+};
+
+Entry *
+entry_create(const char *path, Entry *parent, bool extend, int nesting_level)
+{
+        Entry *e = calloc(1, sizeof(Entry));
+        assert(e != NULL);
+        e->path = strdup(path);
+        e->is_extended = extend;
+        e->is_dir = IsPathDirectory(path);
+        e->parent = parent;
+        e->nesting_level = nesting_level;
+        return e;
+}
+
+Entry_List
+entry_flatten(Entry *e)
+{
+        Entry_List l = { 0 };
+        Da_append(&l, e);
+        if (e->is_dir && e->is_extended) {
+                Da_foreach(f, e->files)
+                {
+                        Entry_List li = entry_flatten(*f);
+                        Da_extend(&l, li);
+                        Da_destroy(&li);
+                }
+        }
+        return l;
+}
 
 char *
 font_find_by_name(const char *name)
@@ -155,335 +184,389 @@ free_resources:
         return sroute;
 }
 
-
-File_Info
-build_entry_get_info(struct dirent *e, struct stat stats)
-{
-        File_Info info;
-        strcpy(info.d_name, e->d_name);
-        info.d_ino = e->d_ino;
-
-        info.st_dev = stats.st_dev;
-        info.st_ino = stats.st_ino;
-        info.st_mode = stats.st_mode;
-        info.st_nlink = stats.st_nlink;
-        info.st_uid = stats.st_uid;
-        info.st_gid = stats.st_gid;
-        info.st_rdev = stats.st_rdev;
-        info.st_size = stats.st_size;
-        info.st_atim = stats.st_atim;
-        info.st_mtim = stats.st_mtim;
-        info.st_ctim = stats.st_ctim;
-        info.st_blksize = stats.st_blksize;
-        info.st_blocks = stats.st_blocks;
-        return info;
-}
-
-Entry *
-build_entry_normal(struct dirent *e, struct stat stats)
-{
-        Entry *entry = calloc(1, sizeof(Entry));
-        entry->info = build_entry_get_info(e, stats);
-        return entry;
-}
-
-Directory *directory_open(File_Info info, const char *path, bool hide_dots, Directory *parent,
-                          bool show_files);
-
-Directory *
-build_entry_dir(struct dirent *e, struct stat stats, bool hide_dots, Directory *parent)
-{
-        Directory *dir =
-                directory_open(build_entry_get_info(e, stats), NULL, hide_dots, parent, false);
-        return dir;
-}
-
-Directory_or_Entry
-build_entry(struct dirent *e, bool hide_dots, Directory *parent)
-{
-        struct stat stats = { 0 };
-
-        if (lstat(e->d_name, &stats)) {
-                perror("lstat");
-        }
-
-        Directory_or_Entry ret;
-        if (S_ISDIR(stats.st_mode)) {
-                ret._d = build_entry_dir(e, stats, hide_dots, parent);
-                ret.type = TYPE_DIR;
-        } else {
-                ret._e = build_entry_normal(e, stats);
-                ret.type = TYPE_ENTRY;
-        }
-        return ret;
-}
-
-void
-count_sub_recursive_up(Directory *d, int count)
-{
-        if (d == NULL) return;
-        d->enties_with_subdir_count -= count;
-        count_sub_recursive_up(d->parent, count);
-}
-
-void
-count_add_recursive_up(Directory *d, int count)
-{
-        if (d == NULL) return;
-        d->enties_with_subdir_count += count;
-        count_add_recursive_up(d->parent, count);
-}
-
-// Free everything D lists and empty the list, leaving D itself alone: it
-// belongs to its parent's list, not to its own.
-void
-directory_entries_free(Directory *d)
-{
-        Da_foreach (e, d->entries) {
-                if (e->type == TYPE_DIR) {
-                        directory_entries_free(e->_d);
-                        free(e->_d);
-                } else {
-                        free(e->_e);
-                }
-        }
-        Da_destroy(&d->entries);
-}
-
-// Fill D->entries from D->path. Returns false if it can't be opened, in
-// which case D is left empty.
-bool
-directory_read_entries(Directory *d, bool hide_dots)
-{
-        DIR *dir = opendir(d->path);
-        if (dir == NULL) return false;
-
-        char cwd[PATH_MAX];
-        bool have_cwd = getcwd(cwd, sizeof cwd) != NULL;
-
-        if (chdir(d->path) == 0) { // so relative paths work without more effort
-                struct dirent *entry;
-                while ((entry = readdir(dir))) {
-                        if (hide_dots && entry->d_name[0] == '.') continue;
-                        Da_append(&d->entries, build_entry(entry, hide_dots, d));
-                }
-                if (have_cwd) {
-                        int restored = chdir(cwd); // best effort: paths are full anyway
-                        (void) restored;
-                }
-        }
-        closedir(dir);
-
-        return true;
-}
-
-// Copy SRC into DST, truncating it if it doesn't fit.
-static void
-path_copy(char *dst, size_t size, const char *src)
-{
-        size_t n = strlen(src);
-        if (n >= size) n = size - 1;
-        memcpy(dst, src, n);
-        dst[n] = '\0';
-}
-
-// Build PARENT/NAME into DST, or "" if it doesn't fit (which can't happen for
-// a path the OS accepted).
-static void
-path_join(char *dst, size_t size, const char *parent, const char *name)
-{
-        size_t p = strlen(parent);
-        size_t n = strlen(name);
-
-        if (p + 1 + n >= size) {
-                dst[0] = '\0';
-                return;
-        }
-        memcpy(dst, parent, p);
-        dst[p] = '/';
-        memcpy(dst + p + 1, name, n + 1);
-}
-
-// Open PATH (the root) or a child of PARENT. The result must be freed with
-// directory_entries_free + free, or kept in a parent's list like this one.
-Directory *
-directory_open(File_Info info, const char *path, bool hide_dots, Directory *parent, bool show_files)
-{
-        Directory *d = calloc(1, sizeof(Directory));
-        d->info = info;
-        d->parent = parent;
-        d->show_files = show_files;
-        // Count this dir's own line too, except for the root: it's never
-        // drawn, only its contents are.
-        d->enties_with_subdir_count = parent ? 1 : 0;
-
-        if (path) {
-                path_copy(d->path, sizeof d->path, path);
-        } else if (parent) {
-                path_join(d->path, sizeof d->path, parent->path, info.d_name);
-        } else {
-                path_copy(d->path, sizeof d->path, info.d_name);
-        }
-
-        if (show_files && directory_read_entries(d, hide_dots)) {
-                d->valid = true;
-                count_add_recursive_up(d, d->entries.count);
-        }
-
-        return d;
-}
-
-File_Info
-get_info(Directory_or_Entry x)
-{
-        switch (x.type) {
-        case TYPE_DIR:
-                assert(x._d);
-                return x._d->info;
-        case TYPE_ENTRY:
-                assert(x._e);
-                return x._e->info;
-        default:
-                abort();
-        }
-}
-
 void
 Write(const char *text, int cw, int ch, Color tint)
 {
         DrawTextEx(G.font, text, (Vector2) { G.csize.x * cw, G.csize.y * ch }, config.font_size, config.font_spacing, tint);
 }
 
+void
+open_directory(Entry *entry)
+{
+        static int nesting_level = 0;
+        assert(IsPathDirectory(entry->path));
+
+        FilePathList list = LoadDirectoryFiles(entry->path);
+        for (unsigned int i = 0; i < list.count; i++) {
+                Entry *e = entry_create(list.paths[i], entry, false, nesting_level);
+                if (e->is_dir) {
+                        ++nesting_level;
+                        open_directory(e);
+                        --nesting_level;
+                }
+                Da_append(&entry->files, e);
+        }
+}
+
+void
+entry_list_print(Entry_List list, int cursor)
+{
+        int tabsize = 2;
+        for (int i = 0; i < list.count; i++) {
+                Entry *e = list.items[i];
+                Color color = WHITE;
+
+                if (i == cursor) {
+                        DrawRectangle(G.csize.x * e->nesting_level * tabsize, G.csize.y * i, G.csize.x, config.font_size, LIGHTGRAY);
+                }
+
+                Write(GetFileName(e->path), e->nesting_level * tabsize, i, color);
+
+                if (e->is_dir) {
+                        Write("/", e->nesting_level * tabsize + strlen(GetFileName(e->path)), i, color);
+                }
+        }
+}
+
+void
+refresh_global_entry_list()
+{
+        if (G.entry_list.capacity > 0) Da_destroy(&G.entry_list);
+        G.entry_list = entry_flatten(G.root);
+}
+
+void
+entry_visibility_show(Entry *e)
+{
+        if (e->is_dir && !e->is_extended) {
+                e->is_extended = true;
+                refresh_global_entry_list();
+        }
+}
+
+void
+entry_visibility_hide(Entry *e)
+{
+        // maybe this should turn off all the subdirs '->extend
+        if (e->is_dir && e->is_extended) {
+                e->is_extended = false;
+                refresh_global_entry_list();
+        }
+}
+
+void
+entry_toggle_visibility(Entry *e)
+{
+        // just for fun
+        (e->is_extended ? entry_visibility_hide : entry_visibility_show)(e);
+}
+
+// clang-format off
+typedef enum  {
+NUL=0, SOH, STX, ETX, EOT, ENQ, ACK, BEL, BS   , HT     , LF , VT ,
+FF   , CR , SO , SI , DLE, DC1, DC2, DC3, DC4  , NAK    , SYN, ETB,
+CAN  , EM , SUB, ESC, FS , GS , RS , US , SPACE, DEL=127,
+}ControlChar;
+// clang-format on
+
+const char WITHOUT_SHIFT[128] = {
+        [0x00] = NUL, /* '\0' (null character)   */
+        [0x01] = SOH, /* (start of heading)      */
+        [0x02] = STX, /* (start of text)         */
+        [0x03] = ETX, /* (end of text)           */
+        [0x04] = EOT, /* (end of transmission)   */
+        [0x05] = ENQ, /* (enquiry)               */
+        [0x06] = ACK, /* (acknowledge)           */
+        [0x07] = BEL, /* '\a' (bell)             */
+        [0x08] = BS,  /* '\b' (backspace)        */
+        [0x09] = HT,  /* '\t' (horizontal tab)   */
+        [0x0A] = LF,  /* '\n' (new line)         */
+        [0x0B] = VT,  /* '\v' (vertical tab)     */
+        [0x0C] = FF,  /* '\f' (form feed)        */
+        [0x0D] = CR,  /* '\r' (carriage ret)     */
+        [0x0E] = SO,  /* (shift out)             */
+        [0x0F] = SI,  /* (shift in)              */
+        [0x10] = DLE, /* (data link escape)      */
+        [0x11] = DC1, /* (device control 1)      */
+        [0x12] = DC2, /* (device control 2)      */
+        [0x13] = DC3, /* (device control 3)      */
+        [0x14] = DC4, /* (device control 4)      */
+        [0x15] = NAK, /* (negative ack.)         */
+        [0x16] = SYN, /* (synchronous idle)      */
+        [0x17] = ETB, /* (end of trans. blk)     */
+        [0x18] = CAN, /* (cancel)                */
+        [0x19] = EM,  /* (end of medium)         */
+        [0x1A] = SUB, /* (substitute)            */
+        [0x1B] = ESC, /* (escape)                */
+        [0x1C] = FS,  /* (file separator)        */
+        [0x1D] = GS,  /* (group separator)       */
+        [0x1E] = RS,  /* (record separator)      */
+        [0x1F] = US,  /* (unit separator)        */
+        [0x20] = SPACE,
+        [0x21] = '!',
+        [0x22] = '"',
+        [0x23] = '#',
+        [0x24] = '$',
+        [0x25] = '%',
+        [0x26] = '&',
+        [0x27] = '\'',
+        [0x28] = '(',
+        [0x29] = ')',
+        [0x2A] = '*',
+        [0x2B] = '+',
+        [0x2C] = ',',
+        [0x2D] = '-',
+        [0x2E] = '.',
+        [0x2F] = '/',
+        [0x30] = '0',
+        [0x31] = '1',
+        [0x32] = '2',
+        [0x33] = '3',
+        [0x34] = '4',
+        [0x35] = '5',
+        [0x36] = '6',
+        [0x37] = '7',
+        [0x38] = '8',
+        [0x39] = '9',
+        [0x3A] = ':',
+        [0x3B] = ';',
+        [0x3C] = '<',
+        [0x3D] = '=',
+        [0x3E] = '>',
+        [0x3F] = '?',
+        [0x40] = '@',
+        [0x41] = 'a',
+        [0x42] = 'b',
+        [0x43] = 'c',
+        [0x44] = 'd',
+        [0x45] = 'e',
+        [0x46] = 'f',
+        [0x47] = 'g',
+        [0x48] = 'h',
+        [0x49] = 'i',
+        [0x4A] = 'j',
+        [0x4B] = 'k',
+        [0x4C] = 'l',
+        [0x4D] = 'm',
+        [0x4E] = 'n',
+        [0x4F] = 'o',
+        [0x50] = 'p',
+        [0x51] = 'q',
+        [0x52] = 'r',
+        [0x53] = 's',
+        [0x54] = 't',
+        [0x55] = 'u',
+        [0x56] = 'v',
+        [0x57] = 'w',
+        [0x58] = 'x',
+        [0x59] = 'y',
+        [0x5A] = 'z',
+        [0x5B] = '[',
+        [0x5C] = '\\',
+        [0x5D] = ']',
+        [0x5E] = '^',
+        [0x5F] = '_',
+        [0x60] = '`',
+        [0x61] = 'a',
+        [0x62] = 'b',
+        [0x63] = 'c',
+        [0x64] = 'd',
+        [0x65] = 'e',
+        [0x66] = 'f',
+        [0x67] = 'g',
+        [0x68] = 'h',
+        [0x69] = 'i',
+        [0x6A] = 'j',
+        [0x6B] = 'k',
+        [0x6C] = 'l',
+        [0x6D] = 'm',
+        [0x6E] = 'n',
+        [0x6F] = 'o',
+        [0x70] = 'p',
+        [0x71] = 'q',
+        [0x72] = 'r',
+        [0x73] = 's',
+        [0x74] = 't',
+        [0x75] = 'u',
+        [0x76] = 'v',
+        [0x77] = 'w',
+        [0x78] = 'x',
+        [0x79] = 'y',
+        [0x7A] = 'z',
+        [0x7B] = '{',
+        [0x7C] = '|',
+        [0x7D] = '}',
+        [0x7E] = '~',
+        [0x7F] = DEL,
+};
+
+const char WITH_SHIFT[128] = {
+        [0x00] = NUL, /* '\0' (null character)   */
+        [0x01] = SOH, /* (start of heading)      */
+        [0x02] = STX, /* (start of text)         */
+        [0x03] = ETX, /* (end of text)           */
+        [0x04] = EOT, /* (end of transmission)   */
+        [0x05] = ENQ, /* (enquiry)               */
+        [0x06] = ACK, /* (acknowledge)           */
+        [0x07] = BEL, /* '\a' (bell)             */
+        [0x08] = BS,  /* '\b' (backspace)        */
+        [0x09] = HT,  /* '\t' (horizontal tab)   */
+        [0x0A] = LF,  /* '\n' (new line)         */
+        [0x0B] = VT,  /* '\v' (vertical tab)     */
+        [0x0C] = FF,  /* '\f' (form feed)        */
+        [0x0D] = CR,  /* '\r' (carriage ret)     */
+        [0x0E] = SO,  /* (shift out)             */
+        [0x0F] = SI,  /* (shift in)              */
+        [0x10] = DLE, /* (data link escape)      */
+        [0x11] = DC1, /* (device control 1)      */
+        [0x12] = DC2, /* (device control 2)      */
+        [0x13] = DC3, /* (device control 3)      */
+        [0x14] = DC4, /* (device control 4)      */
+        [0x15] = NAK, /* (negative ack.)         */
+        [0x16] = SYN, /* (synchronous idle)      */
+        [0x17] = ETB, /* (end of trans. blk)     */
+        [0x18] = CAN, /* (cancel)                */
+        [0x19] = EM,  /* (end of medium)         */
+        [0x1A] = SUB, /* (substitute)            */
+        [0x1B] = ESC, /* (escape)                */
+        [0x1C] = FS,  /* (file separator)        */
+        [0x1D] = GS,  /* (group separator)       */
+        [0x1E] = RS,  /* (record separator)      */
+        [0x1F] = US,  /* (unit separator)        */
+        [0x20] = SPACE,
+        [0x21] = '!',
+        [0x22] = '"',
+        [0x23] = '#',
+        [0x24] = '$',
+        [0x25] = '%',
+        [0x26] = '&',
+        [0x27] = '"',
+        [0x28] = '(',
+        [0x29] = ')',
+        [0x2A] = '*',
+        [0x2B] = '+',
+        [0x2C] = '<',
+        [0x2D] = '_',
+        [0x2E] = '>',
+        [0x2F] = '?',
+        [0x30] = ')',
+        [0x31] = '!',
+        [0x32] = '@',
+        [0x33] = '#',
+        [0x34] = '$',
+        [0x35] = '%',
+        [0x36] = '^',
+        [0x37] = '&',
+        [0x38] = '*',
+        [0x39] = '(',
+        [0x3A] = ':',
+        [0x3B] = ':',
+        [0x3C] = '<',
+        [0x3D] = '+',
+        [0x3E] = '>',
+        [0x3F] = '?',
+        [0x40] = '@',
+        [0x41] = 'A',
+        [0x42] = 'B',
+        [0x43] = 'C',
+        [0x44] = 'D',
+        [0x45] = 'E',
+        [0x46] = 'F',
+        [0x47] = 'G',
+        [0x48] = 'H',
+        [0x49] = 'I',
+        [0x4A] = 'J',
+        [0x4B] = 'K',
+        [0x4C] = 'L',
+        [0x4D] = 'M',
+        [0x4E] = 'N',
+        [0x4F] = 'O',
+        [0x50] = 'P',
+        [0x51] = 'Q',
+        [0x52] = 'R',
+        [0x53] = 'S',
+        [0x54] = 'T',
+        [0x55] = 'U',
+        [0x56] = 'V',
+        [0x57] = 'W',
+        [0x58] = 'X',
+        [0x59] = 'Y',
+        [0x5A] = 'Z',
+        [0x5B] = '{',
+        [0x5C] = '|',
+        [0x5D] = '}',
+        [0x5E] = '^',
+        [0x5F] = '_',
+        [0x60] = '`',
+        [0x61] = 'a',
+        [0x62] = 'b',
+        [0x63] = 'c',
+        [0x64] = 'd',
+        [0x65] = 'e',
+        [0x66] = 'f',
+        [0x67] = 'g',
+        [0x68] = 'h',
+        [0x69] = 'i',
+        [0x6A] = 'j',
+        [0x6B] = 'k',
+        [0x6C] = 'l',
+        [0x6D] = 'm',
+        [0x6E] = 'n',
+        [0x6F] = 'o',
+        [0x70] = 'p',
+        [0x71] = 'q',
+        [0x72] = 'r',
+        [0x73] = 's',
+        [0x74] = 't',
+        [0x75] = 'u',
+        [0x76] = 'v',
+        [0x77] = 'w',
+        [0x78] = 'x',
+        [0x79] = 'y',
+        [0x7A] = 'z',
+        [0x7B] = '{',
+        [0x7C] = '|',
+        [0x7D] = '}',
+        [0x7E] = '~',
+        [0x7F] = DEL,
+};
+
 int
-run_on_directory_or_entry_at_cursor(int cursor, int *i, Directory_List list, void (*f)(Directory_or_Entry *))
+using_no_shift(int kp)
 {
-        Da_foreach(e, list)
-        {
-                if (*i == cursor) {
-                        f(e);
-                        return 1;
-                }
-                ++*i;
-                if (e->type == TYPE_DIR) {
-                        if (run_on_directory_or_entry_at_cursor(cursor, i, e->_d->entries, f)) return 1;
-                }
-        }
-        return 0;
+        if (0 <= kp && kp <= 128)
+                return WITHOUT_SHIFT[kp];
+        return kp;
 }
 
-// print entries [from, to) highlight at cursor.
-void
-write_folder_entries_inner_recursive(int from, int to, int cursor, int *i, Directory_List list)
+int
+using_shift(int kp)
 {
-        static int indent = 0;
-        Da_foreach(e, list)
-        {
-                if (*i >= from && *i < to) {
-                        // should print
-
-                        assert(G.usable.x == 0); // if not, the next
-                                                 // line is not correct
-                        int cw = 0;
-                        Color tint;
-                        if (*i == cursor) {
-                                // should highlight
-                                tint = BLUE;
-                        } else {
-                                tint = WHITE;
-                        }
-                        Write(get_info(*e).d_name, cw + indent * 2, *i - from, tint);
-                }
-                ++*i;
-                if (e->type == TYPE_DIR) {
-                        ++indent;
-                        write_folder_entries_inner_recursive(from, to, cursor, i, e->_d->entries);
-                        --indent;
-                }
-        }
-}
-
-void
-write_folder_entries(int cursor)
-{
-        if (G.root->enties_with_subdir_count == 0) return;
-
-        int line_height = G.csize.y > 0 ? (int) G.csize.y : 1;
-        int page_items = Max((int) (G.usable.height / line_height), 1);
-        int page_num = cursor / page_items;
-        int from = Max(page_num * page_items, 0);
-        int to = Min(G.root->enties_with_subdir_count, (page_num + 1) * page_items);
-        assert(from < to && from <= cursor && cursor < to && to <= G.root->enties_with_subdir_count);
-
-        int i = 0;
-        write_folder_entries_inner_recursive(from, to, cursor, &i, G.root->entries);
-}
-
-void
-action_on_space_entry(Entry *e)
-{
-        printf("YOU CLICK SPACE OVER %s\n", e->info.d_name);
-}
-
-void
-action_on_space_dir(Directory *d)
-{
-        if (d->show_files) {
-                // Collapsing: everything below this dir was counted up to its
-                // ancestors, so remove all of it, not just the direct children.
-                int lines = d->enties_with_subdir_count - 1;
-                d->show_files = false;
-                directory_entries_free(d);
-                count_sub_recursive_up(d, lines);
-        } else {
-                // Expanding: the new children count as (count) extra lines.
-                d->show_files = true;
-                if (directory_read_entries(d, true)) {
-                        count_add_recursive_up(d, d->entries.count);
-                } else {
-                        d->show_files = false;
-                }
-        }
-}
-
-void
-action_on_space(Directory_or_Entry *de)
-{
-        switch (de->type) {
-        case TYPE_DIR:
-                return action_on_space_dir(de->_d);
-        case TYPE_ENTRY:
-                return action_on_space_entry(de->_e);
-        default:
-                abort();
-        }
+        if (0 <= kp && kp <= 128)
+                return WITH_SHIFT[kp];
+        return kp;
 }
 
 // open cwd on null
 void
-explorer(char *path)
+explorer(const char *path)
 {
-        File_Info info = { 0 };
+        G.root = entry_create(path ?: GetWorkingDirectory(), NULL, true, 0);
+        open_directory(G.root);
 
-        char buf[4096];
-        if (path == NULL) {
-                getcwd(buf, sizeof buf);
-                path = buf;
-        }
-
-        // kinda hard-coded
-        info.st_mode = S_IFDIR;
-        path_copy(info.d_name, sizeof info.d_name, path);
-        G.root = directory_open(info, path, true, NULL, true);
-
-        if (!G.root->valid) {
-                return;
-        }
+        refresh_global_entry_list();
+        // Da_foreach(ee, entry_list)
+        // {
+        //         printf("  %s (%s)\n", (*ee)->path, (**ee).is_dir ? "DIR" : "OTH");
+        // }
 
         SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
         InitWindow(config.width, config.height, config.title);
 
         // Load config.font_name or 'monospace' or raylib default
-        G.font = LoadFontEx(font_find_by_name(config.font_name) ?: "monospace", config.font_size, NULL, 0);
+        G.font = LoadFontEx(font_find_by_name(config.font_name) ?: font_find_by_name("monospace"),
+                            config.font_size, NULL, 0);
+
         if (!IsFontValid(G.font)) {
                 G.font = GetFontDefault();
         }
@@ -491,6 +574,9 @@ explorer(char *path)
 
         bool first = true;
         int cursor = 0;
+
+        bool has_ctrl = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
+        bool has_shift = IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT);
 
         while (!WindowShouldClose()) {
                 if (first || IsWindowResized()) {
@@ -506,30 +592,80 @@ explorer(char *path)
                         first = false;
                 }
 
-                // todo: improve input: homerow mods break keys + control not working + implement hold
-                bool has_ctrl = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
+                // clang-format off
+                if (has_ctrl   && IsKeyUp(KEY_LEFT_CONTROL)    && IsKeyUp(KEY_RIGHT_CONTROL))    has_ctrl  = false;
+                if (!has_ctrl  && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL))) has_ctrl  = true;
+                if (has_shift  && IsKeyUp(KEY_LEFT_SHIFT)      && IsKeyUp(KEY_RIGHT_CONTROL))    has_shift = false;
+                if (!has_shift && (IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_CONTROL))) has_shift = true;
+                // clang-format on
 
-                if ((has_ctrl && IsKeyPressed(KEY_N)) || IsKeyPressed(KEY_DOWN)) {
-                        if (G.root->enties_with_subdir_count == 0) {
-                                cursor = 0;
-                        } else if (++cursor >= G.root->enties_with_subdir_count) {
-                                cursor = G.root->enties_with_subdir_count - 1;
+                int key;
+
+                while ((key = GetKeyPressed())) {
+                        if (0) {
                         }
-                }
 
-                if ((has_ctrl && IsKeyPressed(KEY_P)) || IsKeyPressed(KEY_UP)) {
-                        if (--cursor < 0) cursor = 0;
-                }
+                        else if (key == 'J' || (has_ctrl && key == 'N') || key == KEY_DOWN) {
+                                ++cursor;
+                                if (cursor >= G.entry_list.count) cursor = G.entry_list.count - 1;
+                        }
 
-                if (IsKeyPressed(KEY_SPACE)) {
-                        int x = 0;
-                        run_on_directory_or_entry_at_cursor(cursor, &x, G.root->entries, action_on_space);
+                        else if (key == 'K' || (has_ctrl && key == 'P') || key == KEY_UP) {
+                                --cursor;
+                                if (cursor < 0) cursor = 0;
+                        }
+
+                        else if (key == KEY_ENTER) {
+                                printf("ENTER on %s\n", G.entry_list.items[cursor]->path);
+                        }
+
+                        else if (key == KEY_SPACE) {
+                                printf("SPACE on %s\n", G.entry_list.items[cursor]->path);
+                                entry_toggle_visibility(G.entry_list.items[cursor]);
+                        }
+
+                        else if (has_shift && key == '.') { // '>'
+                                // opens the dir
+                                entry_visibility_show(G.entry_list.items[cursor]);
+                        }
+
+                        else if (has_shift && key == ',') { // '<'
+                                // closes the parent dir or current if the
+                                // cursor is over a directory and it's open
+                                if (G.entry_list.items[cursor]->is_dir &&
+                                    G.entry_list.items[cursor]->is_extended) {
+                                        entry_visibility_hide(G.entry_list.items[cursor]);
+                                }
+
+                                else {
+                                        // search for the parent index
+                                        int i = 0;
+                                        for (; i < G.entry_list.count; i++) {
+                                                if (G.entry_list.items[i] == G.entry_list.items[cursor]->parent) {
+                                                        cursor = i;
+                                                        entry_visibility_hide(G.entry_list.items[i]);
+                                                        break;
+                                                }
+                                        }
+                                }
+
+                        }
+
+                        else {
+                                key = has_shift ? using_shift(key) : using_no_shift(key);
+
+                                if (isprint(key)) {
+                                        printf("Unknown key press %d (%c)\n", key, key);
+                                } else {
+                                        printf("Unknown key press %d\n", key);
+                                }
+                        }
                 }
 
                 BeginDrawing();
                 ClearBackground(BLACK);
 
-                write_folder_entries(cursor);
+                entry_list_print(G.entry_list, cursor);
 
                 // window bounds for debugging
                 DrawRectangleLines(0, 0, G.grid.cols * G.csize.x, G.grid.rows * G.csize.y, RED);

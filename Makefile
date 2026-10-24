@@ -76,7 +76,7 @@ WARN = -Wall -Wextra -Wformat=2 -Wshadow $(if $(WERROR),-Werror)
 # raylib: built from source, because its prebuilt Linux binaries are X11 only.
 # BACKEND picks the GLFW backends compiled in; with both, GLFW follows the
 # session (XDG_SESSION_TYPE): Wayland on Wayland, X11 on X11.
-BACKEND ?= x11
+BACKEND ?= both
 ifneq ($(filter x11 wayland both,$(BACKEND)),$(BACKEND))
 $(error BACKEND must be x11, wayland or both, this is $(BACKEND))
 endif
