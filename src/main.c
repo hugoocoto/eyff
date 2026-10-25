@@ -72,7 +72,7 @@
 typedef struct {
         int width;
         int height;
-        const char *title;
+        char *title; // NULL until the config file sets it, "Title" otherwise
         int font_size;
         char *font_name;
         int font_spacing;
@@ -81,8 +81,8 @@ typedef struct {
 Config config = {
         .width = 800,
         .height = 600,
-        .title = "Title",
-        .font_size = 30,
+        .title = NULL,
+        .font_size = 33,
         .font_name = "Iosevka NFM",
         .font_spacing = 0,
 };
@@ -107,17 +107,19 @@ typedef enum Filters {
 // globals
 static struct {
         Font font;
-        Rectangle usable;
-        Vector2 csize;
-        Grid grid;
+        Vector2 char_dimension;
+
+        Rectangle filetree;
+        Grid filetree_c;
+        Rectangle preview;
 
         Entry *root;
-
         Entry_List entry_list;
         Sort_Type entry_list_sort_method;
         Filters entry_list_filters;
 
         int cursor;
+
         bool list_need_refresh;
         bool lazy;
 } g = {
@@ -126,11 +128,19 @@ static struct {
         .lazy = true, // lazy load directory contents
 };
 
+typedef enum Preview_State {
+        PREVIEW_NONE = 0, // not looked at yet
+        PREVIEW_READY,    // texture holds the image
+        PREVIEW_FAILED,   // not an image, or it didn't decode
+} Preview_State;
+
 struct Entry {
         const char *path;
         Entry *parent;
         Entry_List files; // just for directories
         int nesting_level;
+        Texture2D texture; // for previews
+        Preview_State preview;
 
         unsigned char is_dir      : 1;
         unsigned char is_extended : 1;
@@ -214,7 +224,7 @@ free_resources:
 void
 Write(const char *text, int cw, int ch, Color tint)
 {
-        DrawTextEx(g.font, text, (Vector2) { g.csize.x * cw, g.csize.y * ch },
+        DrawTextEx(g.font, text, (Vector2) { g.filetree.x + g.char_dimension.x * cw, g.filetree.y + g.char_dimension.y * ch },
                    config.font_size, config.font_spacing, tint);
 }
 
@@ -239,21 +249,36 @@ entry_list_print(Entry_List list, int cursor)
 {
         int tabsize = 2;
         int tabstart = list.items[0]->nesting_level;
-        for (int i = 0; i < list.count; i++) {
+
+        int items_per_page = g.filetree_c.rows;
+        int page = cursor / items_per_page;
+        int page_start = page * items_per_page;
+        int page_end = Min((page + 1) * items_per_page, list.count);
+
+        // Long names would paint over the preview
+        BeginScissorMode((int) g.filetree.x, (int) g.filetree.y,
+                         (int) g.filetree.width, (int) g.filetree.height);
+
+        for (int i = page_start; i < page_end; i++) {
                 Entry *e = list.items[i];
                 int cx = (e->nesting_level - tabstart) * tabsize;
                 Color color = WHITE;
+                int cy = i - page_start;
 
                 if (i == cursor) {
-                        DrawRectangle(g.csize.x * cx, g.csize.y * i, g.csize.x, config.font_size, LIGHTGRAY);
+                        DrawRectangle(g.filetree.x + g.char_dimension.x * cx,
+                                      g.filetree.y + g.char_dimension.y * cy,
+                                      g.char_dimension.x, config.font_size, LIGHTGRAY);
                 }
 
-                Write(GetFileName(e->path), cx, i, color);
+                Write(GetFileName(e->path), cx, cy, color);
 
                 if (e->is_dir) {
-                        Write("/", cx + strlen(GetFileName(e->path)), i, color);
+                        Write("/", cx + strlen(GetFileName(e->path)), cy, color);
                 }
         }
+
+        EndScissorMode();
 }
 
 int
@@ -607,7 +632,7 @@ const char WITH_SHIFT[128] = {
 int
 using_no_shift(int kp)
 {
-        if (0 <= kp && kp <= 128)
+        if (0 <= kp && kp < 128)
                 return WITHOUT_SHIFT[kp];
         return kp;
 }
@@ -615,7 +640,7 @@ using_no_shift(int kp)
 int
 using_shift(int kp)
 {
-        if (0 <= kp && kp <= 128)
+        if (0 <= kp && kp < 128)
                 return WITH_SHIFT[kp];
         return kp;
 }
@@ -629,6 +654,81 @@ change_root(Entry *new)
         g.list_need_refresh = true;
 }
 
+bool
+entry_looks_like_a_file(Entry *e)
+{
+        // What raylib can decode. IsFileExtension is case-insensitive and takes
+        // a semicolon separated list.
+        return IsFileExtension(e->path, ".png;.jpg;.jpeg;.bmp;.tga;.gif;.qoi;.psd;.hdr;.pnm");
+}
+
+// A preview never needs more pixels than this on its longest side, and a huge
+// image would otherwise take a lot of GPU memory for nothing.
+#define PREVIEW_MAX_DIM 4096
+
+// Load and upload the preview of E once. E->preview tells whether it's worth
+// trying, so this is safe to call every frame.
+void
+preview_ensure(Entry *e)
+{
+        if (e->is_dir || e->preview != PREVIEW_NONE) return;
+
+        if (!entry_looks_like_a_file(e)) {
+                e->preview = PREVIEW_FAILED;
+                return;
+        }
+
+        Image img = LoadImage(e->path);
+        if (!IsImageValid(img)) {
+                e->preview = PREVIEW_FAILED;
+                return;
+        }
+
+        int longest = Max(img.width, img.height);
+        if (longest > PREVIEW_MAX_DIM) {
+                float scale = (float) PREVIEW_MAX_DIM / (float) longest;
+                // Max(1, ...) because a rounded down side would make the image
+                // invalid, and ImageResize would then refuse to do anything
+                ImageResize(&img, Max(1, (int) (img.width * scale + 0.5f)),
+                            Max(1, (int) (img.height * scale + 0.5f)));
+        }
+
+        e->texture = LoadTextureFromImage(img);
+        UnloadImage(img); // the texture has its own copy now
+
+        if (!IsTextureValid(e->texture)) {
+                e->preview = PREVIEW_FAILED;
+                return;
+        }
+
+        SetTextureFilter(e->texture, TEXTURE_FILTER_BILINEAR);
+        e->preview = PREVIEW_READY;
+}
+
+void
+preview_print(Entry *e)
+{
+        if (e->preview != PREVIEW_READY) return;
+
+        // Fit the texture in the preview rect keeping its aspect ratio, and
+        // center it. Scaling at draw time (instead of resizing the image) means
+        // a window resize doesn't reload anything, and small images keep their
+        // real size instead of being blown up.
+        float scale = Min(g.preview.width / (float) e->texture.width,
+                          g.preview.height / (float) e->texture.height);
+        if (scale > 1.0f) scale = 1.0f;
+
+        float w = e->texture.width * scale;
+        float h = e->texture.height * scale;
+
+        DrawTexturePro(e->texture,
+                       (Rectangle) { 0, 0, (float) e->texture.width, (float) e->texture.height },
+                       (Rectangle) { g.preview.x + (g.preview.width - w) / 2,
+                                     g.preview.y + (g.preview.height - h) / 2,
+                                     w, h },
+                       (Vector2) { 0, 0 }, 0.0f, WHITE);
+}
+
 // open cwd on null
 void
 explorer(const char *path)
@@ -638,9 +738,14 @@ explorer(const char *path)
 
         refresh_global_entry_list();
 
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+        // before InitWindow, or its startup logs still show
         SetTraceLogLevel(LOG_WARNING);
-        InitWindow(config.width, config.height, config.title);
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE |  // Set to allow resizable window
+                       FLAG_WINDOW_TOPMOST |    // Set to window always on top
+                       FLAG_WINDOW_HIGHDPI |    // Set to support HighDPI
+                       FLAG_WINDOW_ALWAYS_RUN | // Set to allow windows running while minimized
+                       FLAG_VSYNC_HINT);        // Set to try enabling V-Sync on GPU
+        InitWindow(config.width, config.height, config.title ?: "Title");
 
         // Load config.font_name or 'monospace' or raylib default
         g.font = LoadFontEx(font_find_by_name(config.font_name) ?: font_find_by_name("monospace"),
@@ -656,24 +761,65 @@ explorer(const char *path)
 
         bool has_ctrl = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
         bool has_shift = IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT);
+        bool is_layout_changed = false;
+        enum {
+                LAYOUT_FTT_FPB = 0,     // File tree at the top, file preview at the bottom
+                LAYOUT_FTL_FPR = 1,     // File tree at the left, file preview at the right
+                LAYOUT_INTELLIGENT = 2, // Use the wider setup
+        } layout = 2;
 
         while (!WindowShouldClose()) {
-                if (first || IsWindowResized()) {
-                        g.csize = MeasureTextEx(g.font, " ", config.font_size, config.font_spacing);
-                        g.usable.x = 0;
-                        g.usable.y = 0;
-                        g.usable.width = GetRenderWidth();
-                        g.usable.height = GetRenderHeight();
-                        g.grid.cols = g.csize.x > 0 ? (int) ((g.usable.width - g.usable.x) / g.csize.x) : 0;
-                        g.grid.rows = g.csize.y > 0 ? (int) ((g.usable.height - g.usable.y) / g.csize.y) : 0;
+                if (first || IsWindowResized() || is_layout_changed) {
+                        g.char_dimension = MeasureTextEx(g.font, " ", config.font_size, config.font_spacing);
+                        int marginx = g.char_dimension.x * 1;
+                        int marginy = g.char_dimension.y;
+                        int layout_cpy = layout;
+
+                repeat_switch:
+                        switch (layout_cpy) {
+                        case LAYOUT_FTT_FPB:
+                                g.filetree.x = marginx;
+                                g.filetree.y = marginy;
+                                g.filetree.width = (GetRenderWidth() - marginx) - marginx;
+                                g.filetree.height = (GetRenderHeight() - 3 * g.filetree.y) / 2;
+
+                                g.preview.x = marginx;
+                                g.preview.y = g.filetree.y + g.filetree.height + marginy;
+                                g.preview.width = (GetRenderWidth() - marginx) - marginx;
+                                g.preview.height = (GetRenderHeight() - g.preview.y) - marginy;
+                                break;
+
+                        case LAYOUT_FTL_FPR:
+                                g.filetree.y = marginy;
+                                g.filetree.x = marginx;
+                                g.filetree.height = (GetRenderHeight() - marginy) - marginy;
+                                g.filetree.width = (GetRenderWidth() - 3 * g.filetree.x) / 2;
+
+                                g.preview.y = marginy;
+                                g.preview.x = g.filetree.x + g.filetree.width + marginx;
+                                g.preview.height = (GetRenderHeight() - marginy) - marginy;
+                                g.preview.width = (GetRenderWidth() - g.preview.x) - marginx;
+
+                                break;
+
+                        case LAYOUT_INTELLIGENT:
+                                layout_cpy = (GetRenderHeight() > GetRenderWidth()) ? LAYOUT_FTT_FPB :
+                                                                                      LAYOUT_FTL_FPR;
+                                goto repeat_switch;
+                        }
+
+                        // auto calculated
+                        g.filetree_c.cols = Max(1, (int) (g.filetree.width / g.char_dimension.x));
+                        g.filetree_c.rows = Max(1, (int) (g.filetree.height / g.char_dimension.y));
+
                         first = false;
                 }
 
                 // clang-format off
                 if (has_ctrl   && IsKeyUp(KEY_LEFT_CONTROL)    && IsKeyUp(KEY_RIGHT_CONTROL))    has_ctrl  = false;
                 if (!has_ctrl  && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL))) has_ctrl  = true;
-                if (has_shift  && IsKeyUp(KEY_LEFT_SHIFT)      && IsKeyUp(KEY_RIGHT_CONTROL))    has_shift = false;
-                if (!has_shift && (IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_CONTROL))) has_shift = true;
+                if (has_shift  && IsKeyUp(KEY_LEFT_SHIFT)      && IsKeyUp(KEY_RIGHT_SHIFT))      has_shift = false;
+                if (!has_shift && (IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_SHIFT)))   has_shift = true;
                 // clang-format on
 
                 int key;
@@ -715,7 +861,7 @@ explorer(const char *path)
                                 printf("BACKSPACE on %s\n", g.entry_list.items[g.cursor]->path);
                                 // change the root to the parent folder
                                 if (g.root->parent) {
-                                        change_root(g.entry_list.items[g.cursor]->parent);
+                                        change_root(g.root->parent);
                                 } else {
                                         Entry *e = entry_create(GetPrevDirectoryPath(g.root->path),
                                                                 NULL, true, g.root->nesting_level - 1);
@@ -773,14 +919,24 @@ explorer(const char *path)
                         }
                 }
 
+                if (g.list_need_refresh) refresh_global_entry_list();
+
+                // Before BeginDrawing: decoding a big image takes a while, and
+                // doing it mid-frame stalls the one being drawn.
+                preview_ensure(g.entry_list.items[g.cursor]);
+
                 BeginDrawing();
                 ClearBackground(BLACK);
 
-                if (g.list_need_refresh) refresh_global_entry_list();
-                entry_list_print(g.entry_list, g.cursor);
-
                 // window bounds for debugging
-                DrawRectangleLines(0, 0, g.grid.cols * g.csize.x, g.grid.rows * g.csize.y, RED);
+                DrawRectangleRec(g.filetree, DARKBLUE);
+                DrawRectangleRec(g.preview, DARKGRAY);
+                DrawRectangleLines(g.filetree.x, g.filetree.y,
+                                   g.filetree_c.cols * g.char_dimension.x,
+                                   g.filetree_c.rows * g.char_dimension.y, RED);
+
+                entry_list_print(g.entry_list, g.cursor);
+                preview_print(g.entry_list.items[g.cursor]);
 
                 EndDrawing();
         }
@@ -789,6 +945,7 @@ explorer(const char *path)
 static void
 config_free()
 {
+        free(config.title);
 }
 
 // Returns the user's config file, $XDG_CONFIG_HOME/NAME/config.lua (default
@@ -831,10 +988,19 @@ load_config(const char *path)
                 free(found);
                 return 1;
         }
+        printf("Loading config from %s\n", found);
 
         Conf_get_int(conf, &config.width, "Config.window.width");
         Conf_get_int(conf, &config.height, "Config.window.height");
-        Conf_get_str(conf, &config.title, "Config.window.title");
+
+        // The string Conf_get_str returns belongs to Lua and dies with the
+        // handle at Conf_close, so keep our own copy.
+        const char *title = NULL;
+        if (Conf_get_str(conf, &title, "Config.window.title") == CONF_OK) {
+                free(config.title);
+                config.title = strdup(title);
+        }
+        // todo: add all the things that can be loaded
 
         Conf_close(conf);
         free(found);
