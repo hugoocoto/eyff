@@ -45,6 +45,7 @@
 #include <dirent.h>
 #include <fontconfig/fontconfig.h>
 #include <linux/limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +68,8 @@
 #define VERSION "unknown"
 #endif
 
+#define printf(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__);
+
 // What the config file sets. Add a field for each setting, with its default
 // and its Conf_get_* in load_config, and free what it owns in config_free.
 typedef struct {
@@ -76,15 +79,17 @@ typedef struct {
         int font_size;
         char *font_name;
         int font_spacing;
+        int scroll_margin; // lines kept above and below the cursor
 } Config;
 
 Config config = {
-        .width = 800,
-        .height = 600,
-        .title = NULL,
-        .font_size = 33,
-        .font_name = "Iosevka NFM",
-        .font_spacing = 0,
+        .width         = 800,
+        .height        = 600,
+        .title         = NULL,
+        .font_size     = 33,
+        .font_name     = "Iosevka NFM",
+        .font_spacing  = 0,
+        .scroll_margin = 2,
 };
 
 typedef struct Grid {
@@ -100,7 +105,7 @@ typedef enum Sort_Type {
 } Sort_Type;
 
 typedef enum Filters {
-        FILTER_NONE = 0,
+        FILTER_NONE        = 0,
         FILTER_IGNORE_DOTS = 1 << 0,
 } Filters;
 
@@ -119,13 +124,26 @@ static struct {
         Filters entry_list_filters;
 
         int cursor;
+        int scroll;
+        enum Layout {
+                LAYOUT_FTT_FPB     = 0, // File tree at the top, file preview at the bottom
+                LAYOUT_FTL_FPR     = 1, // File tree at the left, file preview at the right
+                LAYOUT_INTELLIGENT = 2, // Use the wider setup
+        } layout;
+
+        enum Mode {
+                MODE_SHELL,
+                MODE_NORMAL
+        } mode;
 
         bool list_need_refresh;
         bool lazy;
 } g = {
         .entry_list_sort_method = SORT_ALPHA,
-        .entry_list_filters = 0 | FILTER_IGNORE_DOTS,
-        .lazy = true, // lazy load directory contents
+        .entry_list_filters     = 0 | FILTER_IGNORE_DOTS,
+        .lazy                   = true,               // lazy load directory contents
+        .layout                 = LAYOUT_INTELLIGENT, // use wider layout
+        .mode                   = MODE_NORMAL,
 };
 
 typedef enum Preview_State {
@@ -151,10 +169,10 @@ entry_create(const char *path, Entry *parent, bool extend, int nesting_level)
 {
         Entry *e = calloc(1, sizeof(Entry));
         assert(e != NULL);
-        e->path = strdup(path);
-        e->is_extended = extend;
-        e->is_dir = IsPathDirectory(path);
-        e->parent = parent;
+        e->path          = strdup(path);
+        e->is_extended   = extend;
+        e->is_dir        = IsPathDirectory(path);
+        e->parent        = parent;
         e->nesting_level = nesting_level;
         return e;
 }
@@ -182,11 +200,43 @@ cursor_trim()
         if (g.cursor < 0) g.cursor = 0;
 }
 
+void
+scroll_clamp()
+{
+        // g.scroll is the index of the first entry drawn, so the view can stop
+        // on any entry instead of only on page starts.
+        int last = g.entry_list.count - g.filetree_c.rows;
+        if (last < 0) last = 0;
+        if (g.scroll > last) g.scroll = last;
+        if (g.scroll < 0) g.scroll = 0;
+}
+
+// Move the view just enough to keep the cursor config.scroll_margin lines away
+// from the edges. At the start and the end of the list there is nothing to
+// scroll, and scroll_clamp keeps the margin from showing empty rows.
+void
+scroll_follow_cursor()
+{
+        int rows   = g.filetree_c.rows;
+        int margin = config.scroll_margin;
+
+        // Half a screen of margin would leave nowhere to put the cursor
+        if (margin > (rows - 1) / 2) margin = (rows - 1) / 2;
+        if (margin < 0) margin = 0;
+
+        if (g.cursor < g.scroll + margin) {
+                g.scroll = g.cursor - margin;
+        } else if (g.cursor > g.scroll + rows - 1 - margin) {
+                g.scroll = g.cursor - rows + 1 + margin;
+        }
+        scroll_clamp();
+}
+
 char *
 font_find_by_name(const char *name)
 {
-        FcChar8 *route = 0;
-        FcPattern *match = 0;
+        FcChar8 *route     = 0;
+        FcPattern *match   = 0;
         FcPattern *pattern = 0;
         FcResult result;
         char *sroute = 0;
@@ -224,7 +274,10 @@ free_resources:
 void
 Write(const char *text, int cw, int ch, Color tint)
 {
-        DrawTextEx(g.font, text, (Vector2) { g.filetree.x + g.char_dimension.x * cw, g.filetree.y + g.char_dimension.y * ch },
+        DrawTextEx(g.font, text, (Vector2) {
+                                 g.filetree.x + g.char_dimension.x * cw,
+                                 g.filetree.y + g.char_dimension.y * ch,
+                                 },
                    config.font_size, config.font_spacing, tint);
 }
 
@@ -244,28 +297,48 @@ open_directory(Entry *entry)
         }
 }
 
-void
-entry_list_print(Entry_List list, int cursor)
+bool
+is_mouse_on_filetree()
 {
-        int tabsize = 2;
+        Vector2 m = GetMousePosition();
+        return m.x >= g.filetree.x &&
+               m.y >= g.filetree.y &&
+               m.x < g.filetree.x + g.filetree.width &&
+               m.y < g.filetree.y + g.filetree.height;
+}
+
+Entry *
+filetree_get_hovered_entry()
+{
+        if (!is_mouse_on_filetree()) return NULL;
+
+        Vector2 m = GetMousePosition();
+        int row   = (m.y - g.filetree.y) / g.char_dimension.y;
+        if (row < 0 || row >= g.filetree_c.rows) return NULL;
+
+        int i = g.scroll + row;
+        if (i < 0 || i >= g.entry_list.count) {
+                return NULL;
+        }
+        return g.entry_list.items[i];
+}
+
+void
+entry_list_print(Entry_List list)
+{
+        int tabsize  = 2;
         int tabstart = list.items[0]->nesting_level;
 
-        int items_per_page = g.filetree_c.rows;
-        int page = cursor / items_per_page;
-        int page_start = page * items_per_page;
-        int page_end = Min((page + 1) * items_per_page, list.count);
+        int first = g.scroll;
+        int last  = Min(g.scroll + g.filetree_c.rows, list.count);
 
-        // Long names would paint over the preview
-        BeginScissorMode((int) g.filetree.x, (int) g.filetree.y,
-                         (int) g.filetree.width, (int) g.filetree.height);
-
-        for (int i = page_start; i < page_end; i++) {
-                Entry *e = list.items[i];
-                int cx = (e->nesting_level - tabstart) * tabsize;
+        for (int i = first; i < last; i++) {
+                Entry *e    = list.items[i];
+                int cx      = (e->nesting_level - tabstart) * tabsize;
                 Color color = WHITE;
-                int cy = i - page_start;
+                int cy      = i - first;
 
-                if (i == cursor) {
+                if (i == g.cursor) {
                         DrawRectangle(g.filetree.x + g.char_dimension.x * cx,
                                       g.filetree.y + g.char_dimension.y * cy,
                                       g.char_dimension.x, config.font_size, LIGHTGRAY);
@@ -277,8 +350,6 @@ entry_list_print(Entry_List list, int cursor)
                         Write("/", cx + strlen(GetFileName(e->path)), cy, color);
                 }
         }
-
-        EndScissorMode();
 }
 
 int
@@ -300,10 +371,10 @@ filter(Entry_List *list, bool(f)(Entry *))
         }
 }
 
-// true if pass the filter
 bool
 entry_list_filter_dots(Entry *e)
 {
+        // true if pass the filter
         return GetFileName(e->path)[0] != '.';
 }
 
@@ -324,6 +395,7 @@ refresh_global_entry_list()
 
         g.list_need_refresh = false;
         cursor_trim();
+        scroll_clamp();
 }
 
 void
@@ -333,7 +405,7 @@ entry_visibility_show(Entry *e)
                 if (g.lazy && e->files.count == 0 && GetDirectoryFileCount(e->path) > 0) {
                         open_directory(e);
                 }
-                e->is_extended = true;
+                e->is_extended      = true;
                 g.list_need_refresh = true;
         }
 }
@@ -343,7 +415,7 @@ entry_visibility_hide(Entry *e)
 {
         // maybe this should turn off all the subdirs '->extend
         if (e->is_dir && e->is_extended) {
-                e->is_extended = false;
+                e->is_extended      = false;
                 g.list_need_refresh = true;
         }
 }
@@ -351,6 +423,8 @@ entry_visibility_hide(Entry *e)
 void
 entry_toggle_visibility(Entry *e)
 {
+        if (e == NULL) return;
+
         // just for fun
         (e->is_extended ? entry_visibility_hide : entry_visibility_show)(e);
 }
@@ -648,8 +722,9 @@ using_shift(int kp)
 void
 change_root(Entry *new)
 {
-        g.root = new;
+        g.root   = new;
         g.cursor = 0;
+        g.scroll = 0;
         entry_visibility_show(g.root);
         g.list_need_refresh = true;
 }
@@ -657,9 +732,8 @@ change_root(Entry *new)
 bool
 entry_looks_like_a_file(Entry *e)
 {
-        // What raylib can decode. IsFileExtension is case-insensitive and takes
-        // a semicolon separated list.
-        return IsFileExtension(e->path, ".png;.jpg;.jpeg;.bmp;.tga;.gif;.qoi;.psd;.hdr;.pnm");
+        return IsFileExtension(e->path, ".png;.bmp;.tga;.jpg;.gif;.qoi;.pep;.psd;"
+                                        ".dds;.hdr;.pic;.pnm;.ktx;.astc;.pkm;.pvr;");
 }
 
 // A preview never needs more pixels than this on its longest side, and a huge
@@ -729,6 +803,250 @@ preview_print(Entry *e)
                        (Vector2) { 0, 0 }, 0.0f, WHITE);
 }
 
+void
+shell_send(int key)
+{
+        if (isprint(key)) {
+                printf("Key press %d (%c)\n", key, key);
+        } else {
+                printf("Key press %d\n", key);
+        }
+}
+
+void
+handle_resize()
+{
+        g.char_dimension = MeasureTextEx(g.font, " ", config.font_size, config.font_spacing);
+        int marginx      = g.char_dimension.x * 1;
+        int marginy      = g.char_dimension.y;
+        int layout_cpy   = g.layout;
+
+repeat_switch:
+        switch (layout_cpy) {
+        case LAYOUT_FTT_FPB:
+                g.filetree.x      = marginx;
+                g.filetree.y      = marginy;
+                g.filetree.width  = (GetRenderWidth() - marginx) - marginx;
+                g.filetree.height = (GetRenderHeight() - 3 * g.filetree.y) / 2;
+
+                g.preview.x      = marginx;
+                g.preview.y      = g.filetree.y + g.filetree.height + marginy;
+                g.preview.width  = (GetRenderWidth() - marginx) - marginx;
+                g.preview.height = (GetRenderHeight() - g.preview.y) - marginy;
+                break;
+
+        case LAYOUT_FTL_FPR:
+                g.filetree.y      = marginy;
+                g.filetree.x      = marginx;
+                g.filetree.height = (GetRenderHeight() - marginy) - marginy;
+                g.filetree.width  = (GetRenderWidth() - 3 * g.filetree.x) / 2;
+
+                g.preview.y      = marginy;
+                g.preview.x      = g.filetree.x + g.filetree.width + marginx;
+                g.preview.height = (GetRenderHeight() - marginy) - marginy;
+                g.preview.width  = (GetRenderWidth() - g.preview.x) - marginx;
+
+                break;
+
+        case LAYOUT_INTELLIGENT:
+                layout_cpy = (GetRenderHeight() > GetRenderWidth()) ? LAYOUT_FTT_FPB :
+                                                                      LAYOUT_FTL_FPR;
+                goto repeat_switch;
+        }
+
+        // auto calculated
+        g.filetree_c.cols = Max(1, (int) (g.filetree.width / g.char_dimension.x));
+        g.filetree_c.rows = Max(1, (int) (g.filetree.height / g.char_dimension.y));
+
+        // The number of visible rows changed, so the view might be out of range
+        // or the cursor might be off screen.
+        if (g.entry_list.items) scroll_follow_cursor();
+}
+
+void
+action_open_file_at_cursor()
+{
+        printf("ENTER on %s\n", g.entry_list.items[g.cursor]->path);
+        // change the root to the folder under the cursor
+        if (g.root != g.entry_list.items[g.cursor] &&
+            g.entry_list.items[g.cursor]->is_dir) {
+                change_root(g.entry_list.items[g.cursor]);
+        } else if (!g.entry_list.items[g.cursor]->is_dir) {
+                // the problem with this approach is that the terminal is the same, so
+                // nvim runs in the same terminal for example, and logs break nvim. If I
+                // detach, nvim runs in a terminal that is not visible, so it's not a
+                // solution.
+                Command c = { 0 };
+                Command_add(&c, "xdg-open", g.entry_list.items[g.cursor]->path);
+                Command_run_async(c);
+        }
+}
+
+void
+change_root_to_parent()
+{
+        // change the root to the parent folder
+        if (g.root->parent) {
+                change_root(g.root->parent);
+        } else {
+                Entry *e       = entry_create(GetPrevDirectoryPath(g.root->path),
+                                              NULL, true, g.root->nesting_level - 1);
+                g.root->parent = e;
+                open_directory(e);
+                change_root(e);
+        }
+}
+
+void
+process_keyboard_input(int key, bool has_ctrl, bool has_shift)
+{
+        if (0) {
+                // just to align else-if
+        }
+
+        // J, C-n or Down
+        else if (key == 'J' || (has_ctrl && key == 'N') || key == KEY_DOWN) {
+                ++g.cursor;
+                cursor_trim();
+        }
+
+        // k, C-p or Up
+        else if (key == 'K' || (has_ctrl && key == 'P') || key == KEY_UP) {
+                --g.cursor;
+                cursor_trim();
+        }
+
+        else if (key == KEY_ENTER) {
+                action_open_file_at_cursor();
+        }
+
+        else if (key == KEY_BACKSPACE) {
+                change_root_to_parent();
+        }
+
+        else if (key == KEY_SPACE) {
+                printf("SPACE on %s\n", g.entry_list.items[g.cursor]->path);
+                entry_toggle_visibility(g.entry_list.items[g.cursor]);
+        }
+
+        else if (has_shift && key == '.') { // '>'
+                // opens the dir
+                entry_visibility_show(g.entry_list.items[g.cursor]);
+        }
+
+        else if (!has_shift && key == '.') {
+                // toggle dot filter (hide files starting with a dots)
+                g.entry_list_filters ^= FILTER_IGNORE_DOTS;
+                g.list_need_refresh = true;
+        }
+
+        else if (has_shift && key == ',') { // '<'
+                // closes the parent dir or current if the
+                // cursor is over a directory and it's open
+                if (g.entry_list.items[g.cursor]->is_dir &&
+                    g.entry_list.items[g.cursor]->is_extended) {
+                        entry_visibility_hide(g.entry_list.items[g.cursor]);
+                }
+
+                else {
+                        // search for the parent index
+                        int i = 0;
+                        for (; i < g.entry_list.count; i++) {
+                                if (g.entry_list.items[i] == g.entry_list.items[g.cursor]->parent) {
+                                        g.cursor = i;
+                                        entry_visibility_hide(g.entry_list.items[i]);
+                                        break;
+                                }
+                        }
+                }
+        }
+
+        // Whatever moved the cursor, keep it inside the view.
+        scroll_follow_cursor();
+}
+
+void
+handle_file_dropped(const char *path)
+{
+        printf("Dropped file %s at mouse %d %d\n", path, GetMouseX(), GetMouseY());
+
+        if (is_mouse_on_filetree()) {
+                Entry *e = filetree_get_hovered_entry();
+                if (e != NULL) {
+                        Entry *folder = e->is_dir ? e : e->parent;
+                        if (folder != NULL) {
+                                printf("File dropped in folder %s\n", folder->path);
+                        } else {
+                                printf("Error: Can not drop file outside of a folder\n");
+                        }
+                }
+        } else {
+                printf("Error: Can not drop file outside of the filetree\n");
+        }
+}
+
+void
+process_mouse_input()
+{
+        Vector2 delta                = GetMouseDelta();
+        Vector2 m                    = GetMousePosition();
+        float dcum                   = fabs(delta.x) + fabs(delta.y);
+        float mouse_moved_threeshold = 1.0;
+        bool mouse_moved             = dcum > mouse_moved_threeshold;
+
+        // The wheel moves the view only, no need for the pointer to move.
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f && is_mouse_on_filetree()) {
+                g.scroll -= (int) wheel;
+                scroll_clamp();
+
+                // Keep the cursor visible so the preview still matches it.
+                if (g.cursor < g.scroll) g.cursor = g.scroll;
+                if (g.cursor >= g.scroll + g.filetree_c.rows) {
+                        g.cursor = g.scroll + g.filetree_c.rows - 1;
+                }
+        }
+
+        Entry *hovered = filetree_get_hovered_entry();
+
+        if (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) {
+                entry_toggle_visibility(hovered);
+        }
+
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                if (g.entry_list.items[g.cursor] == hovered) {
+                        // sanity check for a click in a file that is not the
+                        // same in which the cursor is in
+                        action_open_file_at_cursor();
+                } else {
+                        printf("Error: mouse pointer and cursor are not at the same file\n");
+                }
+        }
+
+        if (IsMouseButtonPressed(MOUSE_BUTTON_BACK) ||
+            IsMouseButtonPressed(MOUSE_BUTTON_SIDE)) {
+                if (g.entry_list.items[g.cursor] == hovered) {
+                        // sanity check for a click in a file that is not the
+                        // same in which the cursor is in
+                        change_root_to_parent();
+                } else {
+                        printf("Error: mouse pointer and cursor are not at the same file\n");
+                }
+        }
+
+        if (mouse_moved) {
+                // Hovering only moves the cursor: the entry under the pointer is
+                // already in the view. Don't call scroll_follow_cursor here or
+                // the margin would drag the view while the pointer sits on an
+                // edge row.
+                int row = (m.y - g.filetree.y) / g.char_dimension.y;
+                if (row >= 0 && row < g.filetree_c.rows) {
+                        int i = g.scroll + row;
+                        if (i >= 0 && i < g.entry_list.count) g.cursor = i;
+                }
+        }
+}
+
 // open cwd on null
 void
 explorer(const char *path)
@@ -738,13 +1056,14 @@ explorer(const char *path)
 
         refresh_global_entry_list();
 
-        // before InitWindow, or its startup logs still show
         SetTraceLogLevel(LOG_WARNING);
         SetConfigFlags(FLAG_WINDOW_RESIZABLE |  // Set to allow resizable window
                        FLAG_WINDOW_TOPMOST |    // Set to window always on top
                        FLAG_WINDOW_HIGHDPI |    // Set to support HighDPI
                        FLAG_WINDOW_ALWAYS_RUN | // Set to allow windows running while minimized
                        FLAG_VSYNC_HINT);        // Set to try enabling V-Sync on GPU
+
+        SetExitKey(0); // do not exit on ESC
         InitWindow(config.width, config.height, config.title ?: "Title");
 
         // Load config.font_name or 'monospace' or raylib default
@@ -757,62 +1076,24 @@ explorer(const char *path)
         config.font_size = g.font.baseSize;
 
         bool first = true;
-        g.cursor = 0;
+        g.cursor   = 0;
 
-        bool has_ctrl = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
-        bool has_shift = IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT);
+        bool has_ctrl          = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
+        bool has_shift         = IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT);
         bool is_layout_changed = false;
-        enum {
-                LAYOUT_FTT_FPB = 0,     // File tree at the top, file preview at the bottom
-                LAYOUT_FTL_FPR = 1,     // File tree at the left, file preview at the right
-                LAYOUT_INTELLIGENT = 2, // Use the wider setup
-        } layout = 2;
 
         while (!WindowShouldClose()) {
                 if (first || IsWindowResized() || is_layout_changed) {
-                        g.char_dimension = MeasureTextEx(g.font, " ", config.font_size, config.font_spacing);
-                        int marginx = g.char_dimension.x * 1;
-                        int marginy = g.char_dimension.y;
-                        int layout_cpy = layout;
-
-                repeat_switch:
-                        switch (layout_cpy) {
-                        case LAYOUT_FTT_FPB:
-                                g.filetree.x = marginx;
-                                g.filetree.y = marginy;
-                                g.filetree.width = (GetRenderWidth() - marginx) - marginx;
-                                g.filetree.height = (GetRenderHeight() - 3 * g.filetree.y) / 2;
-
-                                g.preview.x = marginx;
-                                g.preview.y = g.filetree.y + g.filetree.height + marginy;
-                                g.preview.width = (GetRenderWidth() - marginx) - marginx;
-                                g.preview.height = (GetRenderHeight() - g.preview.y) - marginy;
-                                break;
-
-                        case LAYOUT_FTL_FPR:
-                                g.filetree.y = marginy;
-                                g.filetree.x = marginx;
-                                g.filetree.height = (GetRenderHeight() - marginy) - marginy;
-                                g.filetree.width = (GetRenderWidth() - 3 * g.filetree.x) / 2;
-
-                                g.preview.y = marginy;
-                                g.preview.x = g.filetree.x + g.filetree.width + marginx;
-                                g.preview.height = (GetRenderHeight() - marginy) - marginy;
-                                g.preview.width = (GetRenderWidth() - g.preview.x) - marginx;
-
-                                break;
-
-                        case LAYOUT_INTELLIGENT:
-                                layout_cpy = (GetRenderHeight() > GetRenderWidth()) ? LAYOUT_FTT_FPB :
-                                                                                      LAYOUT_FTL_FPR;
-                                goto repeat_switch;
-                        }
-
-                        // auto calculated
-                        g.filetree_c.cols = Max(1, (int) (g.filetree.width / g.char_dimension.x));
-                        g.filetree_c.rows = Max(1, (int) (g.filetree.height / g.char_dimension.y));
-
+                        handle_resize();
                         first = false;
+                }
+
+                if (IsFileDropped()) {
+                        FilePathList l = LoadDroppedFiles();
+                        for (unsigned int i = 0; i < l.count; i++) {
+                                handle_file_dropped(l.paths[i]);
+                        }
+                        UnloadDroppedFiles(l);
                 }
 
                 // clang-format off
@@ -823,106 +1104,14 @@ explorer(const char *path)
                 // clang-format on
 
                 int key;
-
+                // Todo: change this to GetCharPressed()
                 while ((key = GetKeyPressed())) {
-                        if (0) {
-                        }
-
-                        // J, C-n or Down
-                        else if (key == 'J' || (has_ctrl && key == 'N') || key == KEY_DOWN) {
-                                ++g.cursor;
-                                cursor_trim();
-                        }
-
-                        // k, C-p or Up
-                        else if (key == 'K' || (has_ctrl && key == 'P') || key == KEY_UP) {
-                                --g.cursor;
-                                cursor_trim();
-                        }
-
-                        else if (key == KEY_ENTER) {
-                                printf("ENTER on %s\n", g.entry_list.items[g.cursor]->path);
-                                // change the root to the folder under the cursor
-                                if (g.root != g.entry_list.items[g.cursor] &&
-                                    g.entry_list.items[g.cursor]->is_dir) {
-                                        change_root(g.entry_list.items[g.cursor]);
-                                } else if (!g.entry_list.items[g.cursor]->is_dir) {
-                                        // the problem with this approach is that the terminal is the same, so
-                                        // nvim runs in the same terminal for example, and logs break nvim. If I
-                                        // detach, nvim runs in a terminal that is not visible, so it's not a
-                                        // solution.
-                                        Command c = { 0 };
-                                        Command_add(&c, "xdg-open", g.entry_list.items[g.cursor]->path);
-                                        Command_run_async(c);
-                                }
-                        }
-
-                        else if (key == KEY_BACKSPACE) {
-                                printf("BACKSPACE on %s\n", g.entry_list.items[g.cursor]->path);
-                                // change the root to the parent folder
-                                if (g.root->parent) {
-                                        change_root(g.root->parent);
-                                } else {
-                                        Entry *e = entry_create(GetPrevDirectoryPath(g.root->path),
-                                                                NULL, true, g.root->nesting_level - 1);
-                                        g.root->parent = e;
-                                        open_directory(e);
-                                        change_root(e);
-                                }
-                        }
-
-                        else if (key == KEY_SPACE) {
-                                printf("SPACE on %s\n", g.entry_list.items[g.cursor]->path);
-                                entry_toggle_visibility(g.entry_list.items[g.cursor]);
-                        }
-
-                        else if (has_shift && key == '.') { // '>'
-                                // opens the dir
-                                entry_visibility_show(g.entry_list.items[g.cursor]);
-                        }
-
-                        else if (!has_shift && key == '.') {
-                                // toggle dot filter (hide files starting with a dots)
-                                g.entry_list_filters ^= FILTER_IGNORE_DOTS;
-                                g.list_need_refresh = true;
-                        }
-
-                        else if (has_shift && key == ',') { // '<'
-                                // closes the parent dir or current if the
-                                // cursor is over a directory and it's open
-                                if (g.entry_list.items[g.cursor]->is_dir &&
-                                    g.entry_list.items[g.cursor]->is_extended) {
-                                        entry_visibility_hide(g.entry_list.items[g.cursor]);
-                                }
-
-                                else {
-                                        // search for the parent index
-                                        int i = 0;
-                                        for (; i < g.entry_list.count; i++) {
-                                                if (g.entry_list.items[i] == g.entry_list.items[g.cursor]->parent) {
-                                                        g.cursor = i;
-                                                        entry_visibility_hide(g.entry_list.items[i]);
-                                                        break;
-                                                }
-                                        }
-                                }
-                        }
-
-                        else {
-                                key = has_shift ? using_shift(key) : using_no_shift(key);
-
-                                if (isprint(key)) {
-                                        printf("Unknown key press %d (%c)\n", key, key);
-                                } else {
-                                        printf("Unknown key press %d\n", key);
-                                }
-                        }
+                        process_keyboard_input(key, has_ctrl, has_shift);
                 }
+                process_mouse_input();
 
                 if (g.list_need_refresh) refresh_global_entry_list();
 
-                // Before BeginDrawing: decoding a big image takes a while, and
-                // doing it mid-frame stalls the one being drawn.
                 preview_ensure(g.entry_list.items[g.cursor]);
 
                 BeginDrawing();
@@ -935,7 +1124,13 @@ explorer(const char *path)
                                    g.filetree_c.cols * g.char_dimension.x,
                                    g.filetree_c.rows * g.char_dimension.y, RED);
 
-                entry_list_print(g.entry_list, g.cursor);
+
+                // Long names would paint over the preview
+                BeginScissorMode((int) g.filetree.x, (int) g.filetree.y,
+                                 (int) g.filetree.width, (int) g.filetree.height);
+                entry_list_print(g.entry_list);
+                EndScissorMode();
+
                 preview_print(g.entry_list.items[g.cursor]);
 
                 EndDrawing();
@@ -957,7 +1152,7 @@ static char *
 find_config(void)
 {
         char path[4096];
-        const char *xdg = getenv("XDG_CONFIG_HOME");
+        const char *xdg  = getenv("XDG_CONFIG_HOME");
         const char *home = getenv("HOME");
 
         if (xdg && *xdg) {
@@ -978,7 +1173,7 @@ find_config(void)
 static int
 load_config(const char *path)
 {
-        Conf conf = NULL;
+        Conf conf   = NULL;
         char *found = NULL;
 
         if (path == NULL && (path = found = find_config()) == NULL) return 0;
@@ -992,6 +1187,7 @@ load_config(const char *path)
 
         Conf_get_int(conf, &config.width, "Config.window.width");
         Conf_get_int(conf, &config.height, "Config.window.height");
+        Conf_get_int(conf, &config.scroll_margin, "Config.scroll_margin");
 
         // The string Conf_get_str returns belongs to Lua and dies with the
         // handle at Conf_close, so keep our own copy.
