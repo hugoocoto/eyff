@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DEPS: liblua5.4-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev
+  DEPS: liblua5.4-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev libfontconfig1-dev
 
 jobs:
   test:
