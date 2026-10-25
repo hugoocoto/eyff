@@ -144,8 +144,8 @@ LuaJIT, with `make LUA=lua5.1` or `make LUA=luajit`):
 
 | Distro        | Packages                                                       |
 |---------------|----------------------------------------------------------------|
-| Arch          | `lua54 libx11 wayland libxkbcommon mesa`                       |
-| Debian/Ubuntu | `liblua5.4-dev libx11-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev` |
+| Arch          | `lua54 libx11 libxrandr libxi libxcursor libxinerama wayland libxkbcommon mesa` |
+| Debian/Ubuntu | `liblua5.4-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev` |
 
 `BACKEND` picks raylib's windowing: `x11` (the default), `wayland`, or `both`
 (one binary, which follows the session: Wayland on Wayland, X11 on X11). The
