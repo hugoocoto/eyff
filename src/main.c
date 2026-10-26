@@ -126,9 +126,10 @@ static struct {
         int cursor;
         int scroll;
         enum Layout {
-                LAYOUT_FTT_FPB     = 0, // File tree at the top, file preview at the bottom
-                LAYOUT_FTL_FPR     = 1, // File tree at the left, file preview at the right
-                LAYOUT_INTELLIGENT = 2, // Use the wider setup
+                LAYOUT_FTT_FPB,           // File tree at the top, file preview at the bottom
+                LAYOUT_FTL_FPR,           // File tree at the left, file preview at the right
+                LAYOUT_FTFS,              // File tree full screen
+                LAYOUT_FT_FP_INTELLIGENT, // Use the wider setup
         } layout;
 
         enum Mode {
@@ -138,12 +139,14 @@ static struct {
 
         bool list_need_refresh;
         bool lazy;
+        bool is_layout_changed;
 } g = {
         .entry_list_sort_method = SORT_ALPHA,
         .entry_list_filters     = 0 | FILTER_IGNORE_DOTS,
-        .lazy                   = true,               // lazy load directory contents
-        .layout                 = LAYOUT_INTELLIGENT, // use wider layout
+        .lazy                   = true,                     // lazy load directory contents
+        .layout                 = LAYOUT_FT_FP_INTELLIGENT, // use wider layout
         .mode                   = MODE_NORMAL,
+        .is_layout_changed      = true,
 };
 
 typedef enum Preview_State {
@@ -848,10 +851,21 @@ repeat_switch:
 
                 break;
 
-        case LAYOUT_INTELLIGENT:
+        case LAYOUT_FT_FP_INTELLIGENT:
                 layout_cpy = (GetRenderHeight() > GetRenderWidth()) ? LAYOUT_FTT_FPB :
                                                                       LAYOUT_FTL_FPR;
                 goto repeat_switch;
+
+        case LAYOUT_FTFS:
+                g.filetree.x      = marginx;
+                g.filetree.y      = marginy;
+                g.filetree.width  = (GetRenderWidth() - marginx) - marginx;
+                g.filetree.height = (GetRenderHeight() - marginy) - marginy;
+                break;
+
+        default:
+                printf("Internal error: switch case not implemented: %d\n", layout_cpy);
+                exit(1);
         }
 
         // auto calculated
@@ -880,6 +894,28 @@ action_open_file_at_cursor()
                 Command_add(&c, "xdg-open", g.entry_list.items[g.cursor]->path);
                 Command_run_async(c);
         }
+}
+
+void
+toggle_preview()
+{
+        static int layout_alt;
+
+        switch (g.layout) {
+        case LAYOUT_FTT_FPB:
+        case LAYOUT_FTL_FPR:
+        case LAYOUT_FT_FP_INTELLIGENT:
+                layout_alt = g.layout;
+                g.layout   = LAYOUT_FTFS;
+                break;
+        case LAYOUT_FTFS:
+                g.layout = layout_alt;
+                break;
+        default:
+                printf("Internal error: switch case not implemented: %d\n", g.layout);
+                exit(1);
+        }
+        g.is_layout_changed = true;
 }
 
 void
@@ -924,7 +960,11 @@ process_keyboard_input(int key, bool has_ctrl, bool has_shift)
                 change_root_to_parent();
         }
 
-        else if (key == KEY_SPACE) {
+        else if (has_ctrl && key == KEY_SPACE) {
+                toggle_preview();
+        }
+
+        else if (!has_ctrl && key == KEY_SPACE) {
                 printf("SPACE on %s\n", g.entry_list.items[g.cursor]->path);
                 entry_toggle_visibility(g.entry_list.items[g.cursor]);
         }
@@ -983,6 +1023,15 @@ handle_file_dropped(const char *path)
         } else {
                 printf("Error: Can not drop file outside of the filetree\n");
         }
+}
+
+void
+process_touch_input()
+{
+        // I want to add swipe left to go back when on touchpad but I don't get
+        // it working: touchpad points report always 0 and gestures.swipe is not
+        // recognised in my linux wayland. Maybe I have to enable some config
+        // flag or somewhat. PLEASE HELP IM GETTING CRAZY
 }
 
 void
@@ -1073,19 +1122,18 @@ explorer(const char *path)
         if (!IsFontValid(g.font)) {
                 g.font = GetFontDefault();
         }
-        config.font_size = g.font.baseSize;
 
-        bool first = true;
-        g.cursor   = 0;
+        config.font_size    = g.font.baseSize;
+        g.cursor            = 0;
+        g.is_layout_changed = true; // force a first layout resize at start
 
-        bool has_ctrl          = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
-        bool has_shift         = IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT);
-        bool is_layout_changed = false;
+        bool has_ctrl  = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
+        bool has_shift = IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT);
 
         while (!WindowShouldClose()) {
-                if (first || IsWindowResized() || is_layout_changed) {
+                if (IsWindowResized() || g.is_layout_changed) {
                         handle_resize();
-                        first = false;
+                        g.is_layout_changed = false;
                 }
 
                 if (IsFileDropped()) {
@@ -1108,6 +1156,8 @@ explorer(const char *path)
                 while ((key = GetKeyPressed())) {
                         process_keyboard_input(key, has_ctrl, has_shift);
                 }
+
+                process_touch_input();
                 process_mouse_input();
 
                 if (g.list_need_refresh) refresh_global_entry_list();
@@ -1117,21 +1167,50 @@ explorer(const char *path)
                 BeginDrawing();
                 ClearBackground(BLACK);
 
-                // window bounds for debugging
-                DrawRectangleRec(g.filetree, DARKBLUE);
-                DrawRectangleRec(g.preview, DARKGRAY);
-                DrawRectangleLines(g.filetree.x, g.filetree.y,
-                                   g.filetree_c.cols * g.char_dimension.x,
-                                   g.filetree_c.rows * g.char_dimension.y, RED);
 
+                switch (g.layout) {
+                case LAYOUT_FTT_FPB:
+                case LAYOUT_FTL_FPR:
+                case LAYOUT_FT_FP_INTELLIGENT:
+                case LAYOUT_FTFS:
+                        // window bounds for debugging
+                        DrawRectangleRec(g.filetree, DARKBLUE);
+                        DrawRectangleLines(g.filetree.x, g.filetree.y,
+                                           g.filetree_c.cols * g.char_dimension.x,
+                                           g.filetree_c.rows * g.char_dimension.y, RED);
+                        // Long names would paint over the preview
+                        BeginScissorMode((int) g.filetree.x, (int) g.filetree.y,
+                                         (int) g.filetree.width, (int) g.filetree.height);
+                        entry_list_print(g.entry_list);
+                        EndScissorMode();
+                        break;
 
-                // Long names would paint over the preview
-                BeginScissorMode((int) g.filetree.x, (int) g.filetree.y,
-                                 (int) g.filetree.width, (int) g.filetree.height);
-                entry_list_print(g.entry_list);
-                EndScissorMode();
+                default:
+                        printf("Internal error: switch case not implemented: %d\n", g.layout);
+                        exit(1);
+                }
 
-                preview_print(g.entry_list.items[g.cursor]);
+                switch (g.layout) {
+                case LAYOUT_FTT_FPB:
+                case LAYOUT_FTL_FPR:
+                case LAYOUT_FT_FP_INTELLIGENT:
+                        // window bounds for debugging
+                        DrawRectangleRec(g.preview, DARKGRAY);
+
+                        BeginScissorMode((int) g.preview.x, (int) g.preview.y,
+                                         (int) g.preview.width, (int) g.preview.height);
+                        preview_print(g.entry_list.items[g.cursor]);
+                        EndScissorMode();
+                        break;
+
+                case LAYOUT_FTFS:
+                        // this one does not have preview
+                        break;
+
+                default:
+                        printf("Internal error: switch case not implemented: %d\n", g.layout);
+                        exit(1);
+                }
 
                 EndDrawing();
         }
