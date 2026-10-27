@@ -7,3 +7,6 @@
 [submodule "src/thirdparty/conf"]
 	path = src/thirdparty/conf
 	url = https://github.com/hugoocoto/conf.h
+[submodule "src/thirdparty/bt"]
+	path = src/thirdparty/bt
+	url = https://github.com/hugoocoto/bt.h

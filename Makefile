@@ -92,7 +92,7 @@ RAYLIB_LIBS_x11 := -lX11
 RAYLIB_LIBS_both := $(RAYLIB_LIBS_x11) $(RAYLIB_LIBS_wayland)
 RAYLIB_LIBS := $(RAYLIB_LIB) $(RAYLIB_LIBS_$(BACKEND)) -lm -ldl -lrt
 # The libraries are -isystem: their warnings are theirs, not this project's
-CPPFLAGS += -D_DEFAULT_SOURCE -Isrc $(addprefix -isystem $(THIRDPARTY)/,flag cum conf) $(RAYLIB_CFLAGS) $(LUA_CFLAGS)
+CPPFLAGS += -D_DEFAULT_SOURCE -Isrc $(addprefix -isystem $(THIRDPARTY)/,flag cum conf bt) $(RAYLIB_CFLAGS) $(LUA_CFLAGS)
 LDLIBS += $(LUA_LIBS) $(RAYLIB_LIBS) -pthread -lfontconfig
 ALL_CFLAGS = -std=c99 $(WARN) $(CFLAGS)
 DEFINES = -DNAME='"$(NAME)"' $(if $(VERSION),-DVERSION='"$(VERSION)"')
@@ -216,10 +216,16 @@ $(BUILD)/$(NAME).1: docs/$(NAME).1 $(BUILD)/.flags
 install: $(BUILD)/$(NAME).1
 install: $(COMPLETIONS)
 
+# The icons the file tree draws: folder.png, file.png, code.png, image.png and
+# one <ext>.png per extension that has its own
+ICONS := $(wildcard assets/*.png)
+
 # install -d, then install: macOS's install has no -D
-install: $(NAME)
+install: $(NAME) $(ICONS)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m755 $(NAME) $(DESTDIR)$(BINDIR)/$(NAME)
+	install -d $(DESTDIR)$(BINDIR)/assets
+	install -m644 $(ICONS) $(DESTDIR)$(BINDIR)/assets/
 	install -d $(DESTDIR)$(MANDIR)
 	install -m644 $(BUILD)/$(NAME).1 $(DESTDIR)$(MANDIR)/$(NAME).1
 	install -d $(DESTDIR)$(BASHCOMPDIR) $(DESTDIR)$(ZSHCOMPDIR) $(DESTDIR)$(FISHCOMPDIR)
@@ -229,6 +235,8 @@ install: $(NAME)
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(NAME)
+	rm -f $(addprefix $(DESTDIR)$(BINDIR)/,$(ICONS))
+	rmdir $(DESTDIR)$(BINDIR)/assets 2>/dev/null || true
 	rm -f $(DESTDIR)$(MANDIR)/$(NAME).1
 	rm -f $(DESTDIR)$(BASHCOMPDIR)/$(NAME) $(DESTDIR)$(ZSHCOMPDIR)/_$(NAME) $(DESTDIR)$(FISHCOMPDIR)/$(NAME).fish
 
@@ -270,7 +278,8 @@ STRIP ?= strip
 
 appimage: $(APPIMAGE)
 
-$(APPIMAGE): $(NAME) assets/icon.svg $(LINUXDEPLOY) $(APPIMAGETOOL) $(RUNTIME)
+$(APPIMAGE): $(NAME) assets/icon.svg $(ICONS) \
+	$(LINUXDEPLOY) $(APPIMAGETOOL) $(RUNTIME)
 	$(call check,$(LINUXDEPLOY),$(LINUXDEPLOY_SHA256_$(ARCH)))
 	$(call check,$(APPIMAGETOOL),$(APPIMAGETOOL_SHA256_$(ARCH)))
 	$(call check,$(RUNTIME),$(RUNTIME_SHA256_$(ARCH)))
@@ -282,7 +291,11 @@ $(APPIMAGE): $(NAME) assets/icon.svg $(LINUXDEPLOY) $(APPIMAGETOOL) $(RUNTIME)
 	cp assets/icon.svg $(BUILD)/$(NAME).svg
 	NO_STRIP=1 $(LINUXDEPLOY) --appdir $(APPDIR) --executable $(NAME) \
 		--desktop-file $(BUILD)/$(NAME).desktop --icon-file $(BUILD)/$(NAME).svg
-	find $(APPDIR)/usr/bin $(APPDIR)/usr/lib -type f -exec $(STRIP) --strip-unneeded {} +
+	mkdir -p $(APPDIR)/usr/bin/assets
+	cp $(ICONS) $(APPDIR)/usr/bin/assets/
+	find $(APPDIR)/usr/bin $(APPDIR)/usr/lib -type f \
+		! -path '$(APPDIR)/usr/bin/assets/*' \
+		-exec $(STRIP) --strip-unneeded {} +
 	ARCH=$(ARCH) $(APPIMAGETOOL) --no-appstream --runtime-file $(RUNTIME) $(APPDIR) $@
 
 $(LINUXDEPLOY):

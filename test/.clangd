@@ -10,4 +10,5 @@ CompileFlags:
     - -I../src/thirdparty/flag
     - -I../src/thirdparty/cum
     - -I../src/thirdparty/conf
+    - -I../src/thirdparty/bt
     - -I/usr/include/lua5.4

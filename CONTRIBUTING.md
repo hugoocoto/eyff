@@ -50,7 +50,7 @@ scripts/test.sh          runs the tests (make test)
 scripts/github-setup.sh  sets up the GitHub repo's settings, with gh
 docs/eyff.1          the man page
 docs/*.typ               Typst documents, to PDF with make docs
-assets/                  the AppImage icon
+assets/                  the AppImage and file-tree icons
 scripts/install.sh       the install script, attached to every release
 scripts/test-install.sh  tests it on a release (CI)
 scripts/release.sh       tags a release (scripts/changelog.sh writes its notes)

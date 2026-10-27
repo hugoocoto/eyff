@@ -11,6 +11,7 @@ CompileFlags:
     - -Ithirdparty/flag
     - -Ithirdparty/cum
     - -Ithirdparty/conf
+    - -Ithirdparty/bt
     - -I..
     - -I../thirdparty/flag
     - -I../thirdparty/cum

@@ -30,6 +30,10 @@ installed() { [[ $("prefix/bin/$name" --version) == "$name $version" ]]; }
 
 run "$@" "$tag"
 installed
+"prefix/bin/$name" --appimage-extract >/dev/null
+test -f "squashfs-root/usr/bin/assets/folder.png"
+test -f "squashfs-root/usr/bin/assets/file.png"
+rm -rf squashfs-root
 test -f "prefix/share/man/man1/$name.1"
 test -f "prefix/share/bash-completion/completions/$name"
 test -f "prefix/share/zsh/site-functions/_$name"

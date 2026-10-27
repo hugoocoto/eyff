@@ -13,6 +13,8 @@ CompileFlags:
     - -isystem
     - thirdparty/conf
     - -isystem
+    - thirdparty/bt
+    - -isystem
     - ../build/tools/raylib-6.2-x11/src
     - -isystem
     - /usr/include/lua5.4

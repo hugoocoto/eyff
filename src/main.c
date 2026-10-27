@@ -2,44 +2,6 @@
 // Copyright (C) 2026 Hugo Coto
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SetLoadFileDataCallback
-// SetSaveFileDataCallback
-// SetLoadFileTextCallback
-// SetSaveFileTextCallback
-// FileRename
-// FileRemove
-// FileCopy
-// FileMove
-// FileTextReplace
-// FileTextFindIndex
-// FileExists
-// DirectoryExists
-// IsFileExtension
-// IsFileHidden
-// GetFileLength
-// GetFileModTime
-// GetFileExtension
-// GetFileName
-// GetFileNameWithoutExt
-// GetDirectoryPath
-// GetPrevDirectoryPath
-// GetWorkingDirectory
-// GetApplicationDirectory
-// MakeDirectory
-// ChangeDirectory
-// IsPathFile
-// IsPathDirectory
-// IsPathAbsolute
-// IsFileNameValid
-// LoadDirectoryFiles
-// LoadDirectoryFilesEx
-// UnloadDirectoryFiles
-// IsFileDropped
-// LoadDroppedFiles
-// UnloadDroppedFiles
-// GetDirectoryFileCount
-// GetDirectoryFileCountEx
-
 #include <assert.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -55,10 +17,21 @@
 #include "lua_compat.h" // before conf.h
 #include "raylib.h"
 
+// What the icon cache stores for each extension
+typedef struct Icon {
+        Image image;
+        Texture2D texture;
+} Icon;
+
+static void icon_free(void *icon);
+
 #define INCLUDE_CONF_IMPLEMENTATION
 #include "conf.h"
 #include "cum.h"
 #include "flag.h"
+#define BT_IMPLEMENTATION
+#define BT_VALUE_DELETE icon_free // bt_destroy unloads every cached icon
+#include "bt.h"
 
 // Both come from the Makefile: NAME from the project, VERSION from git
 #ifndef NAME
@@ -107,6 +80,7 @@ typedef enum Sort_Type {
 typedef enum Filters {
         FILTER_NONE        = 0,
         FILTER_IGNORE_DOTS = 1 << 0,
+        FILTER_SEARCH      = 1 << 1,
 } Filters;
 
 // globals
@@ -114,9 +88,12 @@ static struct {
         Font font;
         Vector2 char_dimension;
 
+        BT icon_cache; // extension -> Icon *, filled as icons are drawn
+
         Rectangle filetree;
         Grid filetree_c;
         Rectangle preview;
+        Rectangle searchbar;
 
         Entry *root;
         Entry_List entry_list;
@@ -133,13 +110,17 @@ static struct {
         } layout;
 
         enum Mode {
-                MODE_SHELL,
+                MODE_SEARCH,
                 MODE_NORMAL
         } mode;
 
         bool list_need_refresh;
         bool lazy;
         bool is_layout_changed;
+
+        int search_i;
+        int search_maxlen;
+        char search[NAME_MAX];
 } g = {
         .entry_list_sort_method = SORT_ALPHA,
         .entry_list_filters     = 0 | FILTER_IGNORE_DOTS,
@@ -147,6 +128,10 @@ static struct {
         .layout                 = LAYOUT_FT_FP_INTELLIGENT, // use wider layout
         .mode                   = MODE_NORMAL,
         .is_layout_changed      = true,
+
+        .search        = "",
+        .search_i      = 0,
+        .search_maxlen = sizeof g.search - 1,
 };
 
 typedef enum Preview_State {
@@ -166,6 +151,39 @@ struct Entry {
         unsigned char is_dir      : 1;
         unsigned char is_extended : 1;
 };
+
+// What raylib can load as an image: previewed, and drawn with image.png
+#define IMAGE_EXTENSIONS ".png;.bmp;.tga;.jpg;.gif;.qoi;.pep;.psd;" \
+                         ".dds;.hdr;.pic;.pnm;.ktx;.astc;.pkm;.pvr"
+// Drawn with code.png
+#define CODE_EXTENSIONS ".c;.h;.cc;.cpp;.cxx;.hh;.hpp;.hxx;.m;.cs;.java;.kt;"   \
+                        ".scala;.go;.rs;.zig;.odin;.d;.swift;.py;.rb;.pl;.php;" \
+                        ".lua;.js;.mjs;.cjs;.ts;.jsx;.tsx;.html;.css;.scss;"    \
+                        ".sh;.bash;.zsh;.fish;.mk;.cmake;.asm;.s;.hs;.ml;"      \
+                        ".ex;.exs;.erl;.clj;.lisp;.el;.scm;.vim;.sql;.r;.jl;"   \
+                        ".dart;.f90;.v;.vhd;.glsl;.hlsl;.wgsl"
+
+bool
+entry_looks_like_a_file(Entry *e)
+{
+        return IsFileExtension(e->path, IMAGE_EXTENSIONS);
+}
+
+// Whether EXT (".c") is in LIST (".c;.h"). Unlike IsFileExtension, it takes
+// the extension itself, and it's case sensitive.
+static bool
+extension_in(const char *ext, const char *list)
+{
+        size_t n = strlen(ext);
+        if (n == 0) return false;
+
+        for (const char *p = list; (p = strstr(p, ext)); p += n) {
+                if ((p == list || p[-1] == ';') && (p[n] == ';' || p[n] == '\0')) {
+                        return true;
+                }
+        }
+        return false;
+}
 
 Entry *
 entry_create(const char *path, Entry *parent, bool extend, int nesting_level)
@@ -326,6 +344,156 @@ filetree_get_hovered_entry()
         return g.entry_list.items[i];
 }
 
+#define ICON_MAX_DIM 32
+
+static bool
+asset_path(char *dst, size_t dst_size, const char *name)
+{
+        const char *app_dir = GetApplicationDirectory();
+
+        if (snprintf(dst, dst_size, "%s/assets/%s", app_dir, name) >=
+            (int) dst_size) {
+                return false;
+        }
+
+        if (access(dst, R_OK) == 0) return true;
+
+        if (snprintf(dst, dst_size, "assets/%s", name) >= (int) dst_size) {
+                return false;
+        }
+
+        return access(dst, R_OK) == 0;
+}
+
+// Cache key for directories: no extension can have a '/' in it
+#define ICON_KEY_DIR "/"
+
+// The image for an extension (".c", ICON_KEY_DIR for directories, "" for no
+// extension), the first of these assets there is: folder.png for
+// directories; else <ext>.png (pdf.png), then image.png or code.png if it's
+// one of IMAGE_EXTENSIONS or CODE_EXTENSIONS, then file.png. NULL if it
+// doesn't load. The caller owns it.
+static Image *
+icon_image_load(const char *ext)
+{
+        char ext_name[NAME_MAX];
+        char path[PATH_MAX];
+        const char *names[3];
+        int count = 0;
+
+        if (strcmp(ext, ICON_KEY_DIR) == 0) {
+                names[count++] = "folder.png";
+        } else {
+                if (*ext && snprintf(ext_name, sizeof ext_name, "%s.png", ext + 1) < (int) sizeof ext_name) {
+                        names[count++] = ext_name;
+                }
+                if (extension_in(ext, IMAGE_EXTENSIONS)) {
+                        names[count++] = "image.png";
+                } else if (extension_in(ext, CODE_EXTENSIONS)) {
+                        names[count++] = "code.png";
+                }
+                names[count++] = "file.png";
+        }
+
+        int i = 0;
+        while (i < count && !asset_path(path, sizeof path, names[i]))
+                i++;
+        if (i == count) {
+                printf("Icon asset %s not found\n", names[count - 1]);
+                return NULL;
+        }
+
+        Image image = LoadImage(path);
+        if (!IsImageValid(image)) {
+                printf("Icon %s could not be loaded\n", path);
+                return NULL;
+        }
+
+        int longest = Max(image.width, image.height);
+        if (longest > ICON_MAX_DIM) {
+                float scale = (float) ICON_MAX_DIM / (float) longest;
+                // Max(1, ...) because a rounded down side would make the image
+                // invalid, and ImageResize would then refuse to do anything
+                ImageResize(&image, Max(1, (int) (image.width * scale + 0.5f)),
+                            Max(1, (int) (image.height * scale + 0.5f)));
+        }
+
+        Image *ret = malloc(sizeof *ret);
+        *ret       = image;
+        return ret;
+}
+
+static void
+icon_free(void *ptr)
+{
+        Icon *icon = ptr;
+        if (IsTextureValid(icon->texture)) UnloadTexture(icon->texture);
+        if (IsImageValid(icon->image)) UnloadImage(icon->image);
+        free(icon);
+}
+
+// The icon for an extension (see icon_image_load), loaded on first use. A
+// failed load is cached too, as an Icon without texture, so it isn't retried
+// every frame.
+static Icon *
+icon_get(const char *ext)
+{
+        char key[NAME_MAX];
+        size_t i;
+        for (i = 0; ext[i] && i < sizeof key - 1; i++) {
+                key[i] = tolower((unsigned char) ext[i]);
+        }
+        key[i] = '\0';
+
+        Icon *icon = bt_get(&g.icon_cache, key);
+        if (icon) return icon;
+
+        icon         = calloc(1, sizeof *icon);
+        Image *image = icon_image_load(key);
+        if (image) {
+                icon->image   = *image;
+                icon->texture = LoadTextureFromImage(icon->image);
+                free(image);
+                if (!IsTextureValid(icon->texture)) {
+                        printf("Texture from icon for '%s' is not valid\n", key);
+                }
+                // SetTextureFilter(icon->texture, TEXTURE_FILTER_BILINEAR);
+        }
+
+        bt_add(&g.icon_cache, key, icon);
+        return icon;
+}
+
+static void
+icon_print(Rectangle icon_rec, Texture2D texture)
+{
+        if (!IsTextureValid(texture)) return;
+
+        float scale = Min(icon_rec.width / (float) texture.width,
+                          icon_rec.height / (float) texture.height);
+        if (scale > 1.0f) scale = 1.0f;
+
+        float w = texture.width * scale;
+        float h = texture.height * scale;
+
+        DrawTexturePro(texture,
+                       (Rectangle) { 0, 0, (float) texture.width,
+                                     (float) texture.height },
+                       (Rectangle) { icon_rec.x + (icon_rec.width - w) / 2,
+                                     icon_rec.y + (icon_rec.height - h) / 2,
+                                     w, h },
+                       (Vector2) { 0, 0 }, 0.0f, WHITE);
+}
+
+void
+icon_get_and_print(int x, int y, int w, int h, Entry *e)
+{
+        int margin         = 0;
+        Rectangle icon_rec = (Rectangle) { x - margin, y - margin, w - margin, h - margin };
+        const char *ext    = e->is_dir ? ICON_KEY_DIR : GetFileExtension(e->path);
+        icon_print(icon_rec, icon_get(ext ?: "")->texture);
+}
+
 void
 entry_list_print(Entry_List list)
 {
@@ -337,20 +505,23 @@ entry_list_print(Entry_List list)
 
         for (int i = first; i < last; i++) {
                 Entry *e    = list.items[i];
-                int cx      = (e->nesting_level - tabstart) * tabsize;
+                int cx      = (e->nesting_level - tabstart + 1) * tabsize;
                 Color color = WHITE;
                 int cy      = i - first;
 
                 if (i == g.cursor) {
-                        DrawRectangle(g.filetree.x + g.char_dimension.x * cx,
+                        DrawRectangle(g.filetree.x + g.char_dimension.x * (cx + 1),
                                       g.filetree.y + g.char_dimension.y * cy,
                                       g.char_dimension.x, config.font_size, LIGHTGRAY);
                 }
 
-                Write(GetFileName(e->path), cx, cy, color);
+                icon_get_and_print(g.filetree.x + g.char_dimension.x * (cx - 2),
+                                   g.filetree.y + g.char_dimension.y * cy,
+                                   2 * g.char_dimension.x, config.font_size, e);
+                Write(GetFileName(e->path), cx + 1, cy, color);
 
                 if (e->is_dir) {
-                        Write("/", cx + strlen(GetFileName(e->path)), cy, color);
+                        Write("/", cx + 1 + strlen(GetFileName(e->path)), cy, color);
                 }
         }
 }
@@ -364,9 +535,7 @@ entry_cmp(const void *a, const void *b)
 void
 filter(Entry_List *list, bool(f)(Entry *))
 {
-        // start at 1 because the first entry is the root path so there is no
-        // reason to hide it
-        for (int i = 1; i < list->count; i++) {
+        for (int i = 0; i < list->count; i++) {
                 if (f(list->items[i]) == false) {
                         Da_remove(list, i);
                         i--;
@@ -379,6 +548,31 @@ entry_list_filter_dots(Entry *e)
 {
         // true if pass the filter
         return GetFileName(e->path)[0] != '.';
+}
+
+bool
+fuzzyicase_match(const char *a, const char *b, const int len_a)
+{
+        const int len_b = (int) strlen(b);
+        int ai          = 0;
+        int bi          = 0;
+
+        if (len_b < len_a) return false;
+
+        for (; bi < len_b; bi++) {
+                if (tolower(a[ai]) == tolower(b[bi])) {
+                        ++ai;
+                }
+        }
+
+        return ai == len_a;
+}
+
+bool
+entry_list_filter_seach(Entry *e)
+{
+        if (g.search_i <= 0) return true;
+        return fuzzyicase_match(g.search, GetFileName(e->path), g.search_i);
 }
 
 void
@@ -395,6 +589,7 @@ refresh_global_entry_list()
 
         if (g.entry_list_sort_method == SORT_ALPHA) entry_list_sort_by_name(&g.entry_list);
         if (g.entry_list_filters & FILTER_IGNORE_DOTS) filter(&g.entry_list, entry_list_filter_dots);
+        if (g.entry_list_filters & FILTER_SEARCH) filter(&g.entry_list, entry_list_filter_seach);
 
         g.list_need_refresh = false;
         cursor_trim();
@@ -732,13 +927,6 @@ change_root(Entry *new)
         g.list_need_refresh = true;
 }
 
-bool
-entry_looks_like_a_file(Entry *e)
-{
-        return IsFileExtension(e->path, ".png;.bmp;.tga;.jpg;.gif;.qoi;.pep;.psd;"
-                                        ".dds;.hdr;.pic;.pnm;.ktx;.astc;.pkm;.pvr;");
-}
-
 // A preview never needs more pixels than this on its longest side, and a huge
 // image would otherwise take a lot of GPU memory for nothing.
 #define PREVIEW_MAX_DIM 4096
@@ -823,6 +1011,11 @@ handle_resize()
         int marginx      = g.char_dimension.x * 1;
         int marginy      = g.char_dimension.y;
         int layout_cpy   = g.layout;
+
+        g.searchbar.x      = marginx;
+        g.searchbar.y      = 0;
+        g.searchbar.width  = (GetRenderWidth() - marginx) - marginx;
+        g.searchbar.height = marginy;
 
 repeat_switch:
         switch (layout_cpy) {
@@ -934,10 +1127,58 @@ change_root_to_parent()
 }
 
 void
-process_keyboard_input(int key, bool has_ctrl, bool has_shift)
+seach_process_keyboard(int key, bool has_ctrl, bool has_shift)
 {
         if (0) {
-                // just to align else-if
+        }
+
+        // maybe this can overlap NORMAL and skip search mode
+        // by searching on char and doing things on mod+char
+
+        else if (key == KEY_ESCAPE) {
+                g.mode = MODE_NORMAL;
+        }
+
+        else if (key == KEY_ENTER) {
+                g.mode = MODE_NORMAL;
+        }
+
+        else if (key == KEY_BACKSPACE) {
+                if (g.search_i > 0) g.search_i--;
+                g.search[g.search_i] = 0;
+                g.list_need_refresh  = true;
+        }
+
+        else {
+                if (key >= ' ' && key < 128) {
+                        key == has_shift ? using_shift(key) : using_no_shift(key);
+                        if (g.search_i < g.search_maxlen) {
+                                g.search[g.search_i]     = key;
+                                g.search[g.search_i + 1] = 0;
+                                g.search_i++;
+                                g.list_need_refresh = true;
+                        }
+                }
+        }
+}
+
+void
+search_clear()
+{
+        // clear search
+        if (g.entry_list_filters & FILTER_SEARCH) {
+                g.search[0] = 0;
+                g.search_i  = 0;
+                g.entry_list_filters &= ~FILTER_SEARCH;
+                g.list_need_refresh = true;
+        }
+}
+
+void
+process_keyboard_input(int key, bool has_ctrl, bool has_shift)
+{
+        if (g.mode == MODE_SEARCH) {
+                return seach_process_keyboard(key, has_ctrl, has_shift);
         }
 
         // J, C-n or Down
@@ -950,6 +1191,10 @@ process_keyboard_input(int key, bool has_ctrl, bool has_shift)
         else if (key == 'K' || (has_ctrl && key == 'P') || key == KEY_UP) {
                 --g.cursor;
                 cursor_trim();
+        }
+
+        else if (key == KEY_ESCAPE) {
+                search_clear();
         }
 
         else if (key == KEY_ENTER) {
@@ -967,6 +1212,17 @@ process_keyboard_input(int key, bool has_ctrl, bool has_shift)
         else if (!has_ctrl && key == KEY_SPACE) {
                 printf("SPACE on %s\n", g.entry_list.items[g.cursor]->path);
                 entry_toggle_visibility(g.entry_list.items[g.cursor]);
+        }
+
+        else if (!has_shift && key == '/') {
+                g.mode = MODE_SEARCH;
+                if (g.entry_list_filters & FILTER_SEARCH) {
+                        g.search[0] = 0;
+                        g.search_i  = 0;
+                        g.entry_list_filters &= ~FILTER_SEARCH;
+                        g.list_need_refresh = true;
+                }
+                g.entry_list_filters |= FILTER_SEARCH;
         }
 
         else if (has_shift && key == '.') { // '>'
@@ -1112,8 +1368,8 @@ explorer(const char *path)
                        FLAG_WINDOW_ALWAYS_RUN | // Set to allow windows running while minimized
                        FLAG_VSYNC_HINT);        // Set to try enabling V-Sync on GPU
 
-        SetExitKey(0); // do not exit on ESC
         InitWindow(config.width, config.height, config.title ?: "Title");
+        SetExitKey(0); // do not exit on ESC
 
         // Load config.font_name or 'monospace' or raylib default
         g.font = LoadFontEx(font_find_by_name(config.font_name) ?: font_find_by_name("monospace"),
@@ -1126,6 +1382,7 @@ explorer(const char *path)
         config.font_size    = g.font.baseSize;
         g.cursor            = 0;
         g.is_layout_changed = true; // force a first layout resize at start
+        toggle_preview();
 
         bool has_ctrl  = IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL);
         bool has_shift = IsKeyPressed(KEY_LEFT_SHIFT) || IsKeyPressed(KEY_RIGHT_SHIFT);
@@ -1167,6 +1424,19 @@ explorer(const char *path)
                 BeginDrawing();
                 ClearBackground(BLACK);
 
+                // SEARCH BAR
+                // window bounds for debugging
+                DrawRectangleRec(g.searchbar, BEIGE);
+                DrawRectangleLines(g.searchbar.x, g.searchbar.y,
+                                   g.searchbar.width, g.searchbar.height, PINK);
+                // Long names would paint over the preview
+                BeginScissorMode((int) g.searchbar.x, (int) g.searchbar.y,
+                                 (int) g.searchbar.width, (int) g.searchbar.height);
+                if (g.entry_list_filters & FILTER_SEARCH) {
+                        DrawTextEx(g.font, "/", (Vector2) { g.searchbar.x, g.searchbar.y }, config.font_size, config.font_spacing, BLACK);
+                        if (g.search_i > 0) DrawTextEx(g.font, g.search, (Vector2) { g.searchbar.x + g.char_dimension.x, g.searchbar.y }, config.font_size, config.font_spacing, BLACK);
+                }
+                EndScissorMode();
 
                 switch (g.layout) {
                 case LAYOUT_FTT_FPB:
@@ -1212,8 +1482,12 @@ explorer(const char *path)
                         exit(1);
                 }
 
+
                 EndDrawing();
         }
+
+        bt_destroy(&g.icon_cache); // before CloseWindow: it unloads textures
+        CloseWindow();
 }
 
 static void
